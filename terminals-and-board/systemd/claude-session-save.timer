@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the open-chats snapshot fresh
+
+[Timer]
+Unit=claude-session-save-tick.service
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

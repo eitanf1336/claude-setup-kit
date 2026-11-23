@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+# claude-whatsapp-doctor: keeps the "My Claude" WhatsApp bot alive.
+#
+# Why this exists: the bot once sat dead for hours. The project
+# directory was moved to another path,
+# which left the systemd unit symlink dangling. Because the *unit file itself*
+# was gone, Restart=always could not help: systemd logged
+# "Failed to schedule restart job: Unit not found" and gave up. The restart
+# counter reached 6619 and nothing ever told the user. Messages sent to the
+# group were silently ignored.
+#
+# So this script does not trust any hardcoded path. It locates bot.py wherever
+# it currently lives, rewrites the unit if it points somewhere stale, repairs
+# the wa-history symlink, and restarts the service. If it cannot fix things it
+# shouts (desktop notification) instead of failing quietly.
+#
+# It happened again, for a completely different reason, and this
+# script reported "healthy" throughout. WhatsApp unlinked the device at 19:49
+# ("Got device removed stream error"); the bridge process stayed up and the bot
+# stayed up, both perfectly idle, because a linked device is not the same thing
+# as a running process. Nothing noticed for an hour, and only the user did.
+# So checks 4b/4c below look at the *link*: is this device still paired, and is
+# the socket actually connected. Losing the pairing needs a phone to fix it, so
+# the repair is to put the QR on screen and say so, loudly, until it is scanned.
+#
+# Run by claude-whatsapp-doctor.timer every 5 minutes, and once at boot.
+
+set -uo pipefail
+
+# The repair paths below shell out to wa-reconnect / notify-send. A watchdog
+# that cannot find its own tools is worse than none, so do not rely on whatever
+# PATH the service happens to inherit.
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+# One owner per WhatsApp session. On a machine marked REMOTE the bridge runs on
+# another machine, so there is nothing to heal here, and starting a bridge here
+# would put the WhatsApp session on two machines at once.
+if [[ -f "$HOME/.config/whatsapp-claude/REMOTE" ]]; then
+    echo "claude-whatsapp-doctor: the bridge runs on another machine (REMOTE marker); nothing to do here"
+    exit 0
+fi
+
+UNIT=claude-whatsapp.service
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_PATH="$UNIT_DIR/$UNIT"
+STATE_DIR="$HOME/.config/claude-whatsapp"
+LOG="$STATE_DIR/doctor.log"
+BRIDGE_UNIT=whatsapp-bridge.service
+
+mkdir -p "$STATE_DIR" "$UNIT_DIR"
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# Keep the log from growing forever.
+if [[ -f "$LOG" ]] && [[ $(stat -c%s "$LOG" 2>/dev/null || echo 0) -gt 1000000 ]]; then
+    tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+HEADLESS=0; [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && HEADLESS=1
+notify() {
+    log "NOTIFY: $*"
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -u critical "Claude WhatsApp bot" "$*" 2>/dev/null
+    # Headless: nobody watches this screen, so also say it in the control group
+    # while the bridge can still send (it cannot once unlinked). The group JID
+    # comes from the bot's own state file, nothing is hard-coded.
+    if (( HEADLESS )); then
+        python3 - "$*" "$STATE_DIR/state.json" <<'PY2' 2>/dev/null || true
+import json, sys, urllib.request
+jid = json.load(open(sys.argv[2])).get("group_jid")
+body = json.dumps({"recipient": jid,
+                   "message": "🤖 WhatsApp doctor: " + sys.argv[1],
+                   "store_local": True}).encode()
+req = urllib.request.Request("http://localhost:8080/api/send", data=body,
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+PY2
+    fi
+}
+
+# --- 1. Find bot.py, wherever it lives now -----------------------------------
+# Ordered guesses first (cheap), then a bounded search under ~/code (robust to
+# any future reorganisation).
+find_bot() {
+    local c
+    for c in \
+        "${WA_BOT_DIR:-$HOME/code/claude-whatsapp-bot}/bot.py" \
+        "$HOME/code/whatsapp/bot/bot.py"
+    do
+        [[ -f "$c" ]] && { printf '%s' "$c"; return 0; }
+    done
+    c=$(find "$HOME/code" -maxdepth 4 -type f -name bot.py \
+            -not -path '*/node_modules/*' -exec grep -l CWB_GROUP_NAME {} + \
+            2>/dev/null | head -n1)
+    [[ -n "$c" ]] && { printf '%s' "$c"; return 0; }
+    return 1
+}
+
+BOT_PY=$(find_bot) || {
+    notify "Cannot find bot.py anywhere under ~/code. The bot is DOWN and I cannot repair it."
+    exit 1
+}
+BOT_DIR=$(dirname "$BOT_PY")
+
+# --- 2. Make sure the unit exists and points at the real bot.py --------------
+need_reload=0
+
+# A dangling symlink is the exact failure we are guarding against: -f is false
+# for it, so this branch catches both "missing" and "points into the void".
+if [[ ! -f "$UNIT_PATH" ]]; then
+    [[ -L "$UNIT_PATH" ]] && { rm -f "$UNIT_PATH"; log "removed dangling unit symlink"; }
+    src="$BOT_DIR/$UNIT"
+    if [[ -f "$src" ]]; then
+        # Install a real copy, not a symlink. A symlink into the project dir is
+        # what broke last time; a copy survives the directory moving again.
+        install -m 644 "$src" "$UNIT_PATH"
+        log "unit was missing; installed copy from $src"
+    else
+        cat >"$UNIT_PATH" <<EOF
+[Unit]
+Description=Claude WhatsApp bot: replies to the "My Claude" self-group via the whatsapp-mcp bridge
+After=network-online.target $BRIDGE_UNIT
+Wants=network-online.target $BRIDGE_UNIT
+
+[Service]
+Type=simple
+WorkingDirectory=$HOME
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 $BOT_PY
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+EOF
+        log "unit was missing and no template found; generated one"
+    fi
+    need_reload=1
+fi
+
+# Unit exists but ExecStart may reference a stale bot.py path.
+cur_exec=$(grep -m1 '^ExecStart=' "$UNIT_PATH" 2>/dev/null || true)
+if [[ -n "$cur_exec" && "$cur_exec" != *"$BOT_PY"* ]]; then
+    sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $BOT_PY|" "$UNIT_PATH"
+    log "ExecStart was stale ($cur_exec) -> now $BOT_PY"
+    need_reload=1
+fi
+
+# Keep the project's own copy of the unit correct too, so a future reinstall
+# from the repo does not reintroduce the stale path.
+proj_unit="$BOT_DIR/$UNIT"
+if [[ -f "$proj_unit" ]] && ! grep -q "ExecStart=.*$BOT_PY" "$proj_unit"; then
+    sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $BOT_PY|" "$proj_unit"
+    log "fixed stale ExecStart in project unit $proj_unit"
+fi
+
+# --- 3. Repair helper symlinks the bot shells out to -------------------------
+# wa-history broke the same way; a dangling link only degrades the bot (it logs
+# WARN and loses conversation history), so it never announced itself.
+for helper in wa-history; do
+    link="$HOME/.local/bin/$helper"
+    target="$BOT_DIR/$helper"
+    if [[ -f "$target" ]] && [[ ! -e "$link" || "$(readlink -f "$link" 2>/dev/null)" != "$target" ]]; then
+        ln -sfn "$target" "$link"
+        log "repaired $helper symlink -> $target"
+    fi
+done
+
+(( need_reload )) && { systemctl --user daemon-reload; log "daemon-reload"; }
+
+# --- 4. Ensure enabled, and the bridge it depends on is up -------------------
+if ! systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null; then
+    systemctl --user enable "$UNIT" >/dev/null 2>&1 && log "re-enabled $UNIT"
+fi
+
+if ! systemctl --user is-active --quiet "$BRIDGE_UNIT" 2>/dev/null; then
+    log "bridge down; starting $BRIDGE_UNIT"
+    systemctl --user start "$BRIDGE_UNIT" 2>/dev/null
+    sleep 5
+fi
+
+# --- 4b. Link health --------------------------------------------------------
+# The failure this section exists for: WhatsApp drops the pairing (device
+# removed on the phone, or the ~2-week linked-device expiry) and every layer
+# above keeps looking fine. Only the link state tells the truth.
+WA_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+RECONNECT_LOCK="$WA_STATE/reconnect.lock"
+LINK_ALERT="$STATE_DIR/.link-alert"        # epoch of last "go scan" shout
+DISCONNECT_MARK="$STATE_DIR/.disconnected" # consecutive not-connected checks
+ALERT_EVERY=1800                           # re-shout every 30 min while unlinked
+
+find_bridge_dir() {
+    local d
+    for d in "${WA_REPO:-$HOME/code/whatsapp-mcp}/whatsapp-bridge"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
+    d=$(find "$HOME/code" -maxdepth 4 -type d -name whatsapp-bridge 2>/dev/null | head -n1)
+    [[ -n "$d" ]] && { printf '%s' "$d"; return 0; }
+    return 1
+}
+BRIDGE_DIR=$(find_bridge_dir || true)
+
+# A linking session in progress owns the bridge: leave it alone, and do not
+# stack a second QR window on top of the one already waiting to be scanned.
+relinking() {
+    [[ -f "$RECONNECT_LOCK" ]] || return 1
+    ! flock -n "$RECONNECT_LOCK" true 2>/dev/null
+}
+
+# Authoritative pairing check straight from whatsmeow's own store: it deletes
+# the device row on logout. Works even against an old bridge build with no
+# /api/status. Echoes yes/no/unknown.
+device_paired() {
+    local db="$BRIDGE_DIR/store/whatsapp.db"
+    [[ -f "$db" ]] || { echo unknown; return; }
+    python3 - "$db" <<'PY' 2>/dev/null || echo unknown
+import sqlite3, sys
+try:
+    c = sqlite3.connect('file:%s?mode=ro' % sys.argv[1], uri=True)
+    n = c.execute('select count(*) from whatsmeow_device').fetchone()[0]
+    print('yes' if n else 'no')
+except Exception:
+    print('unknown')
+PY
+}
+
+api_status=$(curl -s --max-time 4 http://localhost:8080/api/status 2>/dev/null || true)
+api_logged_in=""; api_connected=""
+if [[ -n "$api_status" ]]; then
+    api_logged_in=$(grep -o '"logged_in":[a-z]*' <<<"$api_status" | cut -d: -f2)
+    api_connected=$(grep -o '"connected":[a-z]*' <<<"$api_status" | cut -d: -f2)
+fi
+
+paired=$(device_paired)
+[[ -n "$BRIDGE_DIR" && -f "$BRIDGE_DIR/store/logged_out.flag" ]] && paired=no
+[[ "$api_logged_in" == "false" ]] && paired=no
+
+if relinking; then
+    log "a linking session is in progress; skipping link checks"
+elif [[ "$paired" == "no" ]]; then
+    # Unlinked. Only a phone can fix this, so put the QR on screen and shout.
+    now=$(date +%s)
+    last=$(cat "$LINK_ALERT" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last >= ALERT_EVERY )); then
+        printf '%s' "$now" >"$LINK_ALERT"
+        if (( HEADLESS )); then
+            notify "WhatsApp unlinked this headless machine. The bot cannot see or send anything. Run wa-reconnect over ssh and scan the QR (WhatsApp, Linked devices)."
+        else
+            notify "WhatsApp unlinked this device. The bot cannot see or send anything. Scan the QR window that just opened (WhatsApp → Linked devices)."
+        fi
+        log "UNLINKED: launching wa-reconnect for a QR scan"
+        if command -v wa-reconnect >/dev/null 2>&1; then
+            setsid -f nohup wa-reconnect >>"$WA_STATE/reconnect.log" 2>&1 </dev/null || \
+                notify "Could not launch wa-reconnect. Run it in a terminal: wa-reconnect"
+        else
+            notify "wa-reconnect is missing. Re-link by hand from $BRIDGE_DIR"
+        fi
+    else
+        log "UNLINKED (alerted $((now - last))s ago; waiting for the scan)"
+    fi
+elif [[ -n "$api_status" && "$api_connected" == "false" ]]; then
+    # Paired but the socket is down. One flap is normal; two checks in a row
+    # (10 minutes deaf) is not, so bounce the bridge and escalate if that fails.
+    n=$(cat "$DISCONNECT_MARK" 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n=$((n + 1)); printf '%s' "$n" >"$DISCONNECT_MARK"
+    log "bridge paired but not connected (strike $n)"
+    if (( n >= 2 )); then
+        log "restarting $BRIDGE_UNIT to force a reconnect"
+        systemctl --user restart "$BRIDGE_UNIT" 2>/dev/null
+        sleep 8
+        after=$(curl -s --max-time 4 http://localhost:8080/api/status 2>/dev/null || true)
+        if grep -q '"connected":true' <<<"$after"; then
+            log "bridge reconnected"
+            printf '0' >"$DISCONNECT_MARK"
+        else
+            notify "WhatsApp bridge is paired but will not connect. Messages are not getting through."
+        fi
+    fi
+elif [[ -z "$api_status" ]] && systemctl --user is-active --quiet "$BRIDGE_UNIT" 2>/dev/null; then
+    # Process alive, REST port dead: an old build without /api/status, or a
+    # wedged listener. Distinguish with the send endpoint before restarting.
+    if curl -s --max-time 4 -o /dev/null http://localhost:8080/api/send 2>/dev/null; then
+        log "bridge REST up but /api/status missing; rebuild it (wa-bridge-ctl build)"
+        printf '0' >"$DISCONNECT_MARK"
+    else
+        n=$(cat "$DISCONNECT_MARK" 2>/dev/null || echo 0)
+        [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        n=$((n + 1)); printf '%s' "$n" >"$DISCONNECT_MARK"
+        log "bridge running but REST :8080 is dead (strike $n)"
+        if (( n >= 2 )); then
+            log "restarting $BRIDGE_UNIT (dead REST port)"
+            systemctl --user restart "$BRIDGE_UNIT" 2>/dev/null
+            printf '0' >"$DISCONNECT_MARK"
+        fi
+    fi
+else
+    # Healthy: clear both counters so a future incident starts from zero.
+    printf '0' >"$DISCONNECT_MARK"
+    rm -f "$LINK_ALERT"
+fi
+
+# --- 4d. Deafness: up, linked, and still not reading the group --------------
+# The bot once ignored the group for the third time, and for the third distinct
+# reason: a sender used the bridge's /api/send without "store_local", so the
+# message never reached messages.db, and messages.db is the only thing the bot
+# reads. Process alive, link fine, queue empty, every check above green, user
+# ignored.
+#
+# The lesson from three incidents is that checking the *machinery* is not
+# enough; check the *job*. Two signals, both independent of why it broke:
+#   * heartbeat: the poll loop touches a file every cycle. Stale mtime means
+#     the loop is wedged even when nothing has been sent to it.
+#   * unclaimed rows: a message sitting in the group DB above the bot's
+#     watermark for minutes means the loop is not consuming, whatever its
+#     reason. The reverse (watermark *past* the end of the DB, after the store
+#     is rebuilt on a re-link) makes the bot permanently deaf and is repaired
+#     by resetting the watermark.
+STATE_JSON="$STATE_DIR/state.json"
+HEARTBEAT="$STATE_DIR/heartbeat"
+DEAF_AFTER=${CWD_DEAF_AFTER:-240}         # unclaimed this long = not reading
+BEAT_AFTER=${CWD_BEAT_AFTER:-120}         # poll loop silent this long = wedged
+DEAF_COOLDOWN=${CWD_DEAF_COOLDOWN:-900}   # never bounce for deafness more often
+DEAF_MARK="$STATE_DIR/.deaf-restart"
+
+deaf_restart() {   # $1 = reason
+    local now last
+    now=$(date +%s)
+    last=$(cat "$DEAF_MARK" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last < DEAF_COOLDOWN )); then
+        log "DEAF ($1) but restarted $((now - last))s ago; leaving it alone"
+        return
+    fi
+    printf '%s' "$now" >"$DEAF_MARK"
+    log "DEAF: $1, restarting $UNIT"
+    systemctl --user restart "$UNIT" 2>/dev/null
+    sleep 5
+    if systemctl --user is-active --quiet "$UNIT"; then
+        log "bot restarted after deafness"
+    else
+        notify "Bot was not reading the group ($1) and would not restart."
+    fi
+}
+
+if systemctl --user is-active --quiet "$UNIT" && [[ -n "$BRIDGE_DIR" ]]; then
+    # Wedged poll loop. Skipped silently when the heartbeat file does not exist
+    # yet (an older bot.py, or a bot that just started): absence is not evidence.
+    if [[ -f "$HEARTBEAT" ]]; then
+        beat_age=$(( $(date +%s) - $(stat -c %Y "$HEARTBEAT" 2>/dev/null || date +%s) ))
+        (( beat_age > BEAT_AFTER )) && deaf_restart "poll loop silent for ${beat_age}s"
+    fi
+
+    # Unclaimed messages / runaway watermark.
+    deaf=$(python3 - "$STATE_JSON" "$BRIDGE_DIR/store/messages.db" <<'PY' 2>/dev/null || echo UNKNOWN
+import datetime, json, sqlite3, sys
+
+def out(s):
+    print(s); raise SystemExit
+
+try:
+    st = json.load(open(sys.argv[1]))
+except Exception:
+    out("UNKNOWN")
+jid, last = st.get("group_jid"), st.get("last_rowid")
+if not jid or not isinstance(last, int):
+    out("UNKNOWN")
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % sys.argv[2], uri=True)
+    dbmax = c.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+    # The watermark is past the end of the store: the DB was rebuilt (re-link,
+    # manual delete) and every future message will land below it, unseen.
+    if last > dbmax:
+        out("AHEAD %d" % dbmax)
+    row = c.execute(
+        "SELECT timestamp FROM messages WHERE chat_jid = ? AND rowid > ? "
+        "ORDER BY rowid ASC LIMIT 1", (jid, last)).fetchone()
+except Exception:
+    out("UNKNOWN")
+if not row:
+    out("OK")
+try:
+    ts = datetime.datetime.fromisoformat(str(row[0]))
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    age = int((datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds())
+except Exception:
+    age = 0
+out("UNCLAIMED %d" % max(age, 0))
+PY
+)
+    case "$deaf" in
+        AHEAD*)
+            dbmax=${deaf#AHEAD }
+            log "watermark past end of store (db max $dbmax); resetting and restarting"
+            systemctl --user stop "$UNIT" 2>/dev/null
+            python3 - "$STATE_JSON" "$dbmax" <<'PY' 2>/dev/null
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+s["last_rowid"] = int(sys.argv[2])
+json.dump(s, open(p, "w"))
+PY
+            systemctl --user start "$UNIT" 2>/dev/null
+            notify "The bot's message watermark was past the end of the store (it would have ignored everything). Reset and restarted."
+            ;;
+        UNCLAIMED*)
+            age=${deaf#UNCLAIMED }
+            (( age > DEAF_AFTER )) && \
+                deaf_restart "a message has sat unread in the group for ${age}s"
+            ;;
+    esac
+fi
+
+# --- 5. Ensure the bot is actually running ----------------------------------
+if ! systemctl --user is-active --quiet "$UNIT"; then
+    log "bot not active; starting"
+    systemctl --user reset-failed "$UNIT" 2>/dev/null
+    if systemctl --user start "$UNIT" 2>/dev/null; then
+        sleep 3
+        if systemctl --user is-active --quiet "$UNIT"; then
+            log "bot recovered"
+        else
+            notify "Bot is down and would not start. Run: journalctl --user -u $UNIT -n 50"
+        fi
+    else
+        notify "Bot is down and 'systemctl start' failed. Run: journalctl --user -u $UNIT -n 50"
+    fi
+fi
+
+# --- 6. Flap detection ------------------------------------------------------
+# Active-but-crash-looping looks healthy to is-active. Catch the case where the
+# bot restarts over and over (bad import, bridge schema change) and say so.
+nrestarts=$(systemctl --user show -p NRestarts --value "$UNIT" 2>/dev/null || echo 0)
+mark="$STATE_DIR/.doctor-nrestarts"
+prev=$(cat "$mark" 2>/dev/null || echo 0)
+printf '%s' "$nrestarts" >"$mark"
+if [[ "$nrestarts" =~ ^[0-9]+$ && "$prev" =~ ^[0-9]+$ ]] && (( nrestarts - prev > 5 )); then
+    notify "Bot is crash-looping ($((nrestarts - prev)) restarts since last check). Messages may be missed."
+    log "FLAPPING: $prev -> $nrestarts"
+fi
+
+# --- 7. Are sends actually going out? ---------------------------------------
+# Once the disk filled and every send failed for 8.5 hours ("failed to
+# store sender key ... database or disk is full") while every unit was active
+# and the link was fine. Checking the job means checking the bridge's own
+# verdict on each send. Rate-limited to one alert per 30 minutes.
+fails=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep -c "Message sent false")
+oks=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep -c "Message sent true")
+if (( fails >= 2 && oks == 0 )); then
+    reason=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep "Message sent false" | tail -1 | sed 's/.*Error sending message: //' | cut -c1-160)
+    sm="$STATE_DIR/.doctor-sendfail"
+    if (( $(date +%s) - $(stat -c %Y "$sm" 2>/dev/null || echo 0) > 1800 )); then
+        touch "$sm"
+        hint=""; grep -qi "disk is full\|no space" <<<"$reason" && hint=" The disk is FULL: free space (df -h /)."
+        notify "WhatsApp sends are FAILING ($fails in 10 min, none succeeded): $reason.$hint"
+    fi
+    log "SENDFAIL: $fails failed, 0 ok: $reason"
+fi
+
+exit 0

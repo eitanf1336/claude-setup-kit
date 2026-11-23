@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Fetch + decrypt WhatsApp media straight from the bridge DB (fallback when download_media returns 403).
+Usage: wa-fetch-media <chat_jid> <outdir> [message_id ...]   (needs: pip install cryptography)"""
+import hashlib
+import os
+import sqlite3
+import sys
+import urllib.request
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+DB = os.path.join(os.environ.get("WA_REPO", os.path.expanduser("~/code/whatsapp-mcp")), "whatsapp-bridge/store/messages.db")
+INFO = {
+    "image": b"WhatsApp Image Keys",
+    "video": b"WhatsApp Video Keys",
+    "audio": b"WhatsApp Audio Keys",
+    "document": b"WhatsApp Document Keys",
+}
+
+
+def decrypt(enc, media_key, media_type):
+    exp = HKDF(algorithm=hashes.SHA256(), length=112, salt=None,
+               info=INFO[media_type]).derive(media_key)
+    iv, cipher_key = exp[:16], exp[16:48]
+    ct = enc[:-10]
+    dec = Cipher(algorithms.AES(cipher_key), modes.CBC(iv)).decryptor()
+    plain = dec.update(ct) + dec.finalize()
+    return plain[:-plain[-1]]
+
+
+def main(chat_jid, outdir, msg_ids=None):
+    os.makedirs(outdir, exist_ok=True)
+    con = sqlite3.connect(DB)
+    q = ("SELECT id, filename, url, media_key, file_sha256, media_type FROM messages "
+         "WHERE chat_jid=? AND media_type!=''")
+    rows = con.execute(q, (chat_jid,)).fetchall()
+    if msg_ids:
+        rows = [r for r in rows if r[0] in msg_ids]
+    for mid, fname, url, mkey, sha, mtype in rows:
+        out = os.path.join(outdir, fname)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            print(f"skip {fname}")
+            continue
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            enc = urllib.request.urlopen(req, timeout=120).read()
+            plain = decrypt(enc, mkey, mtype)
+            ok = hashlib.sha256(plain).digest() == sha
+            with open(out, "wb") as f:
+                f.write(plain)
+            print(f"{'OK ' if ok else 'SHA-MISMATCH '}{fname} ({len(plain)} bytes)")
+        except Exception as e:
+            print(f"FAIL {fname}: {e}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2], sys.argv[3:] or None)

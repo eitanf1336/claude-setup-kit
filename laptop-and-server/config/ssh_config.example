@@ -1,0 +1,24 @@
+# Laptop: ~/.ssh/config   (replace the placeholders; the Tailscale name or 100.x address of the server)
+Host server
+    HostName YOUR_SERVER_TAILSCALE_NAME_OR_100_x_ADDRESS
+    User YOUR_USER
+    IdentityFile ~/.ssh/id_ed25519_server
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    # Multiplexing makes every later ssh instant. The master is owned by a systemd user unit
+    # (systemd-user/ssh-mux-server.service) so a frozen terminal cannot wedge it. If you do not
+    # install that unit, use ControlMaster auto + ControlPersist 10m instead.
+    ControlMaster no
+    ControlPath ~/.ssh/cm-%r@%h:%p
+
+# Optional: reach the server over home WiFi when Tailscale is down.
+Host server-lan
+    HostName YOUR_SERVER_LAN_IP
+    User YOUR_USER
+    IdentityFile ~/.ssh/id_ed25519_server
+
+# SERVER side ~/.ssh/config: so the server can reach back to the laptop (Tailscale only, key only).
+Host laptop
+    HostName YOUR_LAPTOP_TAILSCALE_NAME_OR_100_x_ADDRESS
+    User YOUR_USER
+    IdentityFile ~/.ssh/id_ed25519_laptop

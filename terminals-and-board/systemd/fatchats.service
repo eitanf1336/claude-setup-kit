@@ -1,0 +1,6 @@
+[Unit]
+Description=Nudge about Claude chats that are fat enough to compact
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fatchats --notify

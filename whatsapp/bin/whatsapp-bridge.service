@@ -1,0 +1,16 @@
+[Unit]
+Description=WhatsApp bridge (whatsmeow) for Claude, REST on localhost:8080
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WA_REPO__/whatsapp-bridge
+ExecStart=__WA_REPO__/whatsapp-bridge/whatsapp-bridge-bin
+# The REST API has no auth. Bind it to loopback only:
+Environment=BRIDGE_LISTEN=127.0.0.1:8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

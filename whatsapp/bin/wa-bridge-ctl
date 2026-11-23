@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# wa-bridge-ctl {start|stop|status|restart|build}, manage the WhatsApp Go bridge.
+#
+# Config (override via env or ~/.config/whatsapp-claude/config):
+#   WA_REPO   path to the cloned whatsapp-mcp repo (default ~/code/whatsapp-mcp)
+#   GO_BIN    path to the go binary (autodetected)
+set -euo pipefail
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
+[ -f "$CFG" ] && . "$CFG"
+
+WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
+BRIDGE_DIR="$WA_REPO/whatsapp-bridge"
+BIN="$BRIDGE_DIR/whatsapp-bridge-bin"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+mkdir -p "$STATE"
+PIDFILE="$STATE/bridge.pid"
+LOG="$STATE/bridge.log"
+
+find_go() {
+  if [ -n "${GO_BIN:-}" ] && [ -x "$GO_BIN" ]; then echo "$GO_BIN"; return; fi
+  for g in "$(command -v go 2>/dev/null || true)" "$HOME/.local/go-sdk/go/bin/go" /usr/local/go/bin/go; do
+    [ -n "$g" ] && [ -x "$g" ] && { echo "$g"; return; }
+  done
+  echo ""; return 1
+}
+
+is_running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+build() {
+  local go; go="$(find_go)"
+  [ -z "$go" ] && { echo "go not found, install Go or set GO_BIN" >&2; exit 1; }
+  echo "building bridge with $go ..."
+  ( cd "$BRIDGE_DIR" && "$go" build -o whatsapp-bridge-bin . )
+  echo "built $BIN"
+}
+
+start() {
+  [ -x "$BIN" ] || build
+  if is_running; then echo "already running (pid $(cat "$PIDFILE"))"; return; fi
+  ( cd "$BRIDGE_DIR" && nohup "$BIN" >"$LOG" 2>&1 & echo $! >"$PIDFILE" )
+  echo "started bridge pid $(cat "$PIDFILE"), log: $LOG"
+}
+
+stop() {
+  if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; sleep 1
+    kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true; fi
+  rm -f "$PIDFILE"; echo "stopped"
+}
+
+status() {
+  if is_running; then
+    echo "bridge: RUNNING (pid $(cat "$PIDFILE"))"
+  else
+    echo "bridge: stopped"
+  fi
+  if curl -s --max-time 2 http://localhost:8080/api/send -o /dev/null 2>/dev/null; then
+    echo "REST :8080: reachable"
+  else
+    echo "REST :8080: not reachable"
+  fi
+}
+
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  build) build ;;
+  status) status ;;
+  *) echo "usage: wa-bridge-ctl {start|stop|status|restart|build}"; exit 1 ;;
+esac

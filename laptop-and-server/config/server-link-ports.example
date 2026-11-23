@@ -1,0 +1,5 @@
+# Copy to ~/.config/server-link/ports   (laptop side)
+# One port per line. Each one is forwarded laptop 127.0.0.1:PORT -> server 127.0.0.1:PORT.
+# Text after the number is a comment. The port must be FREE on the laptop (stop the laptop copy of the service first).
+7800 status screen (server-now API)
+8000 example: a web app that moved to the server

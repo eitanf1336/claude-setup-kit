@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Claude WhatsApp bot every 2 minutes (and shortly after boot)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+# Catch up immediately after the machine was asleep.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

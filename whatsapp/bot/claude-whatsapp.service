@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude WhatsApp bot: replies to the "My Claude" self-group via the whatsapp-mcp bridge
+After=network-online.target whatsapp-bridge.service
+# Wants, not Requires: Requires propagates the bridge's restarts to this unit,
+# and KillMode=mixed then kills whatever `claude -p` is mid-job. Ordering is
+# enough, the bot survives a bridge outage by itself (logs "bridge down", retries).
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional overrides, see the CWB_* table in GUIDE.md:
+# Environment=CWB_GROUP_NAME=My Claude
+# Environment=CWB_PERMISSION_ARGS=--permission-mode default
+EnvironmentFile=-%h/.config/claude-whatsapp/bot.env
+ExecStart=/usr/bin/python3 __BOT_PY__
+Restart=always
+RestartSec=5
+# Keep claude subprocesses alive with the service
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

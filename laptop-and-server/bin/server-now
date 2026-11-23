@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""server-now: set what a project is doing on the server screen's "Running now" list.
+
+  server-now                                   show the list
+  server-now <project> <word> [detail]         e.g. server-now myproject working "task 12"
+  server-now <project> <word> --ttl 2h         word lasts 2h (default 30m), then the auto word returns
+  server-now <project> --clear                 drop your word now
+  --name "Nice Name"                           label to show (default: the project key)
+
+Works on the laptop too if port 7800 is listed in the server-link ports file.
+"""
+import json, re, sys, urllib.request
+
+URL = 'http://127.0.0.1:7800'
+
+
+def ttl(v):
+    m = re.fullmatch(r'(\d+)([smhd]?)', v)
+    if not m:
+        sys.exit(f'bad --ttl {v!r} (use 90s, 30m, 2h, 1d)')
+    return int(m[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[m[2]]
+
+
+a = sys.argv[1:]
+if a and a[0] in ('-h', '--help'):
+    sys.exit(__doc__)
+body, pos = {}, []
+while a:
+    x = a.pop(0)
+    if x == '--clear':
+        body['clear'] = True
+    elif x == '--ttl' and a:
+        body['ttl'] = ttl(a.pop(0))
+    elif x == '--name' and a:
+        body['name'] = a.pop(0)
+    else:
+        pos.append(x)
+try:
+    if not pos:
+        d = json.load(urllib.request.urlopen(URL + '/api/stats', timeout=10)).get('running') or {}
+        for it in d.get('items', []):
+            print(f"{it['key']:<18} {it['word']:<11} {it['name']}  {it.get('detail', '')}".rstrip())
+        sys.exit(0)
+    body['key'] = pos[0]
+    if len(pos) > 1:
+        body['word'] = pos[1]
+    if len(pos) > 2:
+        body['detail'] = ' '.join(pos[2:])
+    if not body.get('clear') and 'word' not in body:
+        sys.exit(__doc__)
+    req = urllib.request.Request(URL + '/api/now', data=json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json'})
+    r = json.load(urllib.request.urlopen(req, timeout=10))
+    print('ok' if r.get('ok') else r)
+except OSError as e:
+    sys.exit(f'server screen not reachable at {URL}: {e}')

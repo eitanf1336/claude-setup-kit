@@ -1,0 +1,4 @@
+# Copy to ~/.config/laptop-and-server/config  (sourced by bash scripts: server, server-link, chat-move)
+# ssh aliases (see ssh_config.example). Keep the defaults if you name your aliases "server" and "laptop".
+SERVER_HOST=server
+LAPTOP_HOST=laptop

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for fat Claude chats every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=fatchats.service
+
+[Install]
+WantedBy=timers.target

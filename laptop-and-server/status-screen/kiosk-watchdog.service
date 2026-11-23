@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the server kiosk if its page stopped talking to the status screen
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/status-screen/kiosk-watchdog

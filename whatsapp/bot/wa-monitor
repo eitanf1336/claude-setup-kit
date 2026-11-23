@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+wa-monitor, arm / disarm chats for the WhatsApp auto-reply daemon (monitor.py).
+
+The daemon answers, as "your assistant", every new incoming message in the chats
+listed here, until you disarm them. This CLI is the only way chats get onto that
+list. Arming a chat is an outward-facing action: from that moment the daemon will
+reply to that person on your behalf.
+
+Usage:
+  wa-monitor list                       # show armed chats + daemon status
+  wa-monitor add <name|number|jid> [--name "Nice Name"] [--note "extra persona"]
+                                        [--command]   # only reply to !claude
+  wa-monitor mode <chat> <all|command>  # switch an armed chat's trigger mode
+  wa-monitor facts <chat> <on|off>      # may replies use the owner's real schedule /
+                                        # deadline calendar? (default: on)
+  wa-monitor ask-me <chat> <on|off>     # last resort: pop a question it still
+                                        # can't answer onto the owner's screen and
+                                        # wait for him to type it (default: off)
+  wa-monitor stop <name|number|jid>     # disarm one chat
+  wa-monitor stop-all                   # disarm everything (kill switch)
+  wa-monitor pause <chat> / resume <chat>
+  wa-monitor find <query>               # show matching chats (to grab a JID)
+  wa-monitor status                     # daemon health + recent auto-replies
+
+Trigger modes:
+  all       (default) reply to every new message in the chat
+  command   only reply when a message starts with "!claude"
+            (the trigger is stripped before Claude sees the text)
+
+Resolution: a bare name/number is matched against the bridge's chat list. If it's
+ambiguous or not found (WhatsApp often stores a contact's chat under an opaque
+'@lid' id, not their saved name), pass the exact JID, `wa-monitor find` prints it.
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+# If the WhatsApp stack (bridge, registries, daemons) runs on another machine
+# (REMOTE marker), manage it there. Where the REMOTE marker exists, manage it there instead of editing a
+# local copy nothing reads.
+if os.path.exists(os.path.expanduser("~/.config/whatsapp-claude/REMOTE")):
+    import shlex
+    os.execvp("ssh", ["ssh", "-o", "BatchMode=yes"] + (["-t"] if sys.stdin.isatty() else [])
+              + [os.environ.get("WA_REMOTE_HOST", "CHANGE_ME_HOST"),
+                 " ".join([".local/bin/wa-monitor"] + [shlex.quote(a) for a in sys.argv[1:]])])
+
+HOME        = os.path.expanduser("~")
+
+
+def _state_group_jid():
+    try:
+        with open(os.path.join(HOME, ".config/claude-whatsapp/state.json"), encoding="utf-8") as f:
+            return json.load(f).get("group_jid", "")
+    except Exception:
+        return ""
+
+CFG_DIR     = os.path.join(HOME, ".config/claude-whatsapp")
+REGISTRY    = os.environ.get("CWM_REGISTRY", os.path.join(CFG_DIR, "monitored.json"))
+SENT_LOG    = os.environ.get("CWM_SENT_LOG", os.path.join(CFG_DIR, "monitor_sent.jsonl"))
+MESSAGES_DB = os.environ.get("CWB_MESSAGES_DB",
+                os.path.join(os.environ.get("WA_REPO", os.path.join(HOME, "code/whatsapp-mcp")), "whatsapp-bridge/store/messages.db"))
+CONTROL_JID  = os.environ.get("CWB_GROUP_JID") or _state_group_jid()
+CONTROL_NAME = os.environ.get("CWB_GROUP_NAME", "My Claude")
+SERVICE      = "claude-whatsapp-monitor.service"
+
+
+# ---------------------------------------------------------------- registry io
+def load_reg():
+    try:
+        with open(REGISTRY, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"chats": {}}
+    except Exception as e:
+        sys.exit(f"error: cannot read registry {REGISTRY}: {e}")
+
+
+def save_reg(reg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(reg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, REGISTRY)
+
+
+# ---------------------------------------------------------------- db helpers
+def db():
+    return sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
+
+
+def find_chats(query):
+    """Return [(jid, name, last_message_time)] matching a name substring or number."""
+    q = (query or "").strip()
+    like = f"%{q}%"
+    with db() as c:
+        if "@" in q:                       # explicit JID
+            rows = c.execute(
+                "SELECT jid, COALESCE(name,''), COALESCE(last_message_time,'') "
+                "FROM chats WHERE jid = ?", (q,)).fetchall()
+            if rows:
+                return rows
+            return [(q, "", "")]           # allow arming a JID the chats table lacks
+        digits = re.sub(r"\D", "", q)
+        rows = c.execute(
+            "SELECT jid, COALESCE(name,''), COALESCE(last_message_time,'') FROM chats "
+            "WHERE name LIKE ? COLLATE NOCASE "
+            + ("OR jid LIKE ? " if digits else "") +
+            "ORDER BY last_message_time DESC LIMIT 25",
+            ((like, f"%{digits}%") if digits else (like,))).fetchall()
+    return rows
+
+
+def max_rowid_for(jid):
+    with db() as c:
+        return c.execute("SELECT COALESCE(MAX(rowid),0) FROM messages WHERE chat_jid=?",
+                         (jid,)).fetchone()[0]
+
+
+def resolve_one(query):
+    """Resolve to a single (jid, name) or exit with candidates."""
+    rows = find_chats(query)
+    if not rows:
+        sys.exit(f"No chat matches {query!r}. Try `wa-monitor find {query}` or pass a JID.")
+    if len(rows) > 1:
+        print(f"Ambiguous, {len(rows)} chats match {query!r}. Re-run with the JID:")
+        for jid, name, lmt in rows[:15]:
+            print(f"  {jid}   {name or '(no name)'}   last: {str(lmt)[:16]}")
+        sys.exit(1)
+    jid, name, _ = rows[0]
+    return jid, name
+
+
+# ---------------------------------------------------------------- service
+def svc_active():
+    try:
+        out = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
+                             capture_output=True, text=True, timeout=8)
+        return out.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def recent_sends(jid=None, n=5):
+    if not os.path.exists(SENT_LOG):
+        return []
+    out = []
+    with open(SENT_LOG, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if jid and r.get("chat_jid") != jid:
+                continue
+            out.append(r)
+    return out[-n:]
+
+
+# ---------------------------------------------------------------- commands
+def cmd_add(args):
+    jid, found_name = resolve_one(args.target)
+    if jid == CONTROL_JID or (found_name or "").strip() == CONTROL_NAME:
+        sys.exit("Refusing to arm the control group (that's bot.py's channel).")
+    name = args.name or found_name or jid
+    mode = "command" if args.command else (args.mode or "all")
+    reg = load_reg()
+    base = max_rowid_for(jid)
+    reg.setdefault("chats", {})[jid] = {
+        "name": name,
+        "jid": jid,
+        "added_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "baseline_rowid": base,
+        "enabled": True,
+        "mode": mode,
+        "note": args.note or "",
+    }
+    save_reg(reg)
+    print(f"Armed: {name}  [{jid}]   mode: {mode}")
+    if mode == "command":
+        print("  Will reply ONLY to messages starting with '!claude'.")
+    else:
+        print(f"  Will auto-reply to every message arriving from now on (baseline rowid {base}).")
+    if svc_active() != "active":
+        print(f"  NOTE: monitor service is '{svc_active()}'. Start it: "
+              f"systemctl --user start {SERVICE}")
+
+
+def resolve_armed(chats, target):
+    """JID of the armed chat `target` names, exiting on miss/ambiguity."""
+    if target in chats:
+        return target
+    matches = [j for j, m in chats.items()
+               if target.lower() in m.get("name", "").lower() or target in j]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print("Ambiguous among armed chats:")
+        for j in matches:
+            print(f"  {j}  {chats[j].get('name')}")
+        sys.exit(1)
+    sys.exit(f"Not armed: {target!r}. See `wa-monitor list`.")
+
+
+def cmd_facts(args):
+    """Whether this chat's replies may use the owner's real schedule (exams,
+    deadlines) as background. On by default; turn it off for a chat that
+    shouldn't see it."""
+    if args.state not in ("on", "off"):
+        sys.exit("state must be 'on' or 'off'.")
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    key = resolve_armed(chats, args.target)
+    chats[key]["facts"] = (args.state == "on")
+    save_reg(reg)
+    print(f"{chats[key].get('name', key)} -> facts: {args.state}")
+    if args.state == "on":
+        print("  Replies can answer exam/deadline questions concretely.")
+    else:
+        print("  Replies stay blind to his calendar in this chat.")
+
+
+def cmd_ask_me(args):
+    """Last resort for a chat: when the replier still can't answer after
+    searching, pop the question onto the owner's screen and wait. Off by default,
+    because retrieval is supposed to make interrupting him unnecessary."""
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    key = resolve_armed(chats, args.target)
+    chats[key]["ask_me"] = (args.state == "on")
+    save_reg(reg)
+    print(f"{chats[key].get('name', key)} -> ask-me: {args.state}")
+    if args.state == "on":
+        print("  A question it can't answer will pop up on your screen and wait "
+              "2 minutes for you.")
+
+
+def cmd_mode(args):
+    if args.mode not in ("all", "command"):
+        sys.exit("mode must be 'all' or 'command'.")
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    key = resolve_armed(chats, args.target)
+    chats[key]["mode"] = args.mode
+    save_reg(reg)
+    print(f"{chats[key].get('name', key)} -> mode: {args.mode}")
+    if args.mode == "command":
+        print("  Now replies ONLY to messages starting with '!claude'.")
+
+
+def cmd_stop(args):
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    # accept a JID directly, or resolve a name against the ARMED set first
+    key = args.target
+    if key not in chats:
+        matches = [j for j, m in chats.items()
+                   if args.target.lower() in (m.get("name", "").lower())
+                   or args.target in j]
+        if len(matches) == 1:
+            key = matches[0]
+        elif len(matches) > 1:
+            print("Ambiguous among armed chats:")
+            for j in matches:
+                print(f"  {j}  {chats[j].get('name')}")
+            sys.exit(1)
+    if key not in chats:
+        sys.exit(f"Not armed: {args.target!r}. See `wa-monitor list`.")
+    name = chats[key].get("name", key)
+    del chats[key]
+    save_reg(reg)
+    print(f"Disarmed: {name}  [{key}]")
+
+
+def cmd_stop_all(args):
+    reg = load_reg()
+    n = len(reg.get("chats", {}))
+    reg["chats"] = {}
+    save_reg(reg)
+    print(f"Disarmed all ({n} chat(s)). The daemon will stop replying to everyone.")
+
+
+def cmd_pause(args, enable):
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    key = args.target
+    if key not in chats:
+        matches = [j for j, m in chats.items()
+                   if args.target.lower() in m.get("name", "").lower() or args.target in j]
+        if len(matches) == 1:
+            key = matches[0]
+    if key not in chats:
+        sys.exit(f"Not armed: {args.target!r}.")
+    chats[key]["enabled"] = enable
+    save_reg(reg)
+    print(f"{'Resumed' if enable else 'Paused'}: {chats[key].get('name', key)}")
+
+
+def cmd_list(args):
+    reg = load_reg()
+    chats = reg.get("chats", {})
+    print(f"Monitor service: {svc_active()}")
+    if not chats:
+        print("No chats armed. Nobody is being auto-replied to.")
+        return
+    print(f"Armed chats ({len(chats)}):")
+    for jid, m in chats.items():
+        flag = "" if m.get("enabled", True) else "  (PAUSED)"
+        mode = (m.get("mode") or "all")
+        modeflag = "  [!claude only]" if mode == "command" else ""
+        factflag = "" if m.get("facts", True) else "  [no schedule facts]"
+        factflag += "  [asks you on screen]" if m.get("ask_me") else ""
+        last = recent_sends(jid, 1)
+        lastline = f"  last auto-reply: {last[0]['ts']}" if last else "  no auto-replies yet"
+        print(f"  • {m.get('name', jid)}{flag}{modeflag}{factflag}")
+        print(f"      jid: {jid}   armed: {m.get('added_ts','?')}")
+        print(f"    {lastline}")
+        if m.get("note"):
+            print(f"      note: {m['note']}")
+
+
+def cmd_find(args):
+    rows = find_chats(args.target)
+    if not rows:
+        print("No matches.")
+        return
+    for jid, name, lmt in rows:
+        print(f"  {jid}   {name or '(no name)'}   last: {str(lmt)[:16]}")
+
+
+def cmd_status(args):
+    print(f"Monitor service : {svc_active()}")
+    reg = load_reg()
+    print(f"Armed chats     : {len(reg.get('chats', {}))}")
+    sends = recent_sends(n=8)
+    print(f"Recent auto-replies ({len(sends)} shown):")
+    for r in sends:
+        who = r.get("chat_jid", "?")
+        print(f"  [{r.get('ts','?')}] -> {who}: {(r.get('text','') or '')[:70]!r}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="wa-monitor", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("add", help="arm a chat for auto-reply")
+    a.add_argument("target"); a.add_argument("--name"); a.add_argument("--note")
+    a.add_argument("--command", action="store_true",
+                   help="only reply to messages starting with !claude")
+    a.add_argument("--mode", choices=["all", "command"],
+                   help="trigger mode (default: all)")
+    a.set_defaults(func=cmd_add)
+
+    md = sub.add_parser("mode", help="switch an armed chat between all / command")
+    md.add_argument("target"); md.add_argument("mode", choices=["all", "command"])
+    md.set_defaults(func=cmd_mode)
+
+    fa = sub.add_parser("facts", help="let a chat's replies use the owner's real "
+                                      "exam/deadline schedule (default: on)")
+    fa.add_argument("target"); fa.add_argument("state", choices=["on", "off"])
+    fa.set_defaults(func=cmd_facts)
+
+    am = sub.add_parser("ask-me", help="pop unanswerable questions onto the owner's "
+                                       "screen as a last resort (default: off)")
+    am.add_argument("target"); am.add_argument("state", choices=["on", "off"])
+    am.set_defaults(func=cmd_ask_me)
+
+    s = sub.add_parser("stop", help="disarm a chat"); s.add_argument("target")
+    s.set_defaults(func=cmd_stop)
+
+    sub.add_parser("stop-all", help="disarm every chat").set_defaults(func=cmd_stop_all)
+
+    pa = sub.add_parser("pause", help="pause a chat without forgetting it")
+    pa.add_argument("target"); pa.set_defaults(func=lambda a: cmd_pause(a, False))
+    re_ = sub.add_parser("resume", help="resume a paused chat")
+    re_.add_argument("target"); re_.set_defaults(func=lambda a: cmd_pause(a, True))
+
+    sub.add_parser("list", help="show armed chats").set_defaults(func=cmd_list)
+    sub.add_parser("status", help="daemon health + recent sends").set_defaults(func=cmd_status)
+
+    f = sub.add_parser("find", help="search chats"); f.add_argument("target")
+    f.set_defaults(func=cmd_find)
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        p.print_help(); sys.exit(0)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

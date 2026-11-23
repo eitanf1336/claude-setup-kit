@@ -1,0 +1,15 @@
+[Unit]
+Description=Remember which Claude chats are open (and save them at logout)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Nothing to do while the session runs. ExecStop fires as the graphical session
+# goes away, the last moment the open chats can still be seen.
+ExecStart=/bin/true
+ExecStop=%h/.local/bin/claude-session save
+
+[Install]
+WantedBy=graphical-session.target

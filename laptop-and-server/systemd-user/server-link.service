@@ -1,0 +1,14 @@
+# Laptop. Install: cp to ~/.config/systemd/user/ ; systemctl --user daemon-reload ; systemctl --user enable --now server-link
+# After editing the ports file: systemctl --user restart server-link
+[Unit]
+Description=Forward laptop localhost ports to the home server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/bin/server-link
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

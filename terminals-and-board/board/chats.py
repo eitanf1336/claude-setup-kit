@@ -1,0 +1,4390 @@
+#!/usr/bin/env python3
+"""
+chats, an interactive board for organizing your Claude Code chats into categories.
+
+Self-contained, standard-library only (uses curses). It only READS your chat files
+under ~/.claude/projects and stores your category tags in its own file
+(~/.claude/chats/categories.json). Deleting ~/.claude/chats removes the tool with
+zero effect on your actual chats.
+
+Keys:
+  ↑/↓ or k/j   move selection
+  Enter        open the chat, attaches if it's a live agent (Ctrl+Z to detach,
+               keeps running), otherwise resumes a finished chat. On a section
+               header, Enter (or Space) collapses/expands that section.
+  Space        collapse/expand the section header your cursor is on
+  n            start a new chat as a background agent, leave with Ctrl+Z and
+               it keeps running (just like attaching to an existing agent)
+  r            rename the selected chat
+  m            move the selected chat to a project (independent of its folder)
+  o            set the start permission mode (auto / acceptEdits / plan / …) for
+               the project you're viewing, same picker as 'm' in the P panel,
+               but without opening it. In "All projects" it targets the selected
+               chat's project.
+  f            fork a copy of the selected chat
+  x            stop the selected live agent
+  s            cycle the selected chat's mark. Press once for ★ starred (bright
+               yellow row, "deal with this"), again for ♡ special (just a quiet
+               heart on an otherwise normal row, "I love this one and might
+               wander back to it in five years for no reason"), again to clear.
+  Ctrl+S       show ONLY marked chats, both ★ and ♡, everything else hidden.
+               Press again to go back to the full board. Not remembered between
+               launches, so the board never opens mysteriously half-empty.
+  1..6         file the selected chat into a category. A freshly-filed chat
+               sorts to the TOP of its category, so an accidental move stays in
+               plain sight instead of sinking into a big pile.
+  u            undo the last category move (revert the chat to where it was)
+  a            show (or fold again) the older copies of same-named chats
+  /            find a chat by name and jump to it, anywhere on the board, press
+               / again to cycle to the next match. Reaches chats in collapsed
+               sections (it expands the section it lands in).
+  P            projects panel, switch active project, add a folder, rename,
+               remove. The active project filters the board and is where new
+               chats start. Inside the panel: h hides (or unhides) the selected
+               project, dropping it from the list and its chats from the "all
+               projects" board; Ctrl+H toggles showing the hidden ones; c gives
+               the project a different color.
+
+Every project also gets its own color (see projcolor.py), so you can tell at a
+glance which one a terminal belongs to: the board's header chip and the rules
+above and below the list are drawn in it, every row's [tag] wears its own
+project's color, and while you're inside a chat the text cursor is tinted with
+it and the status line leads with a matching chip.
+  d            delete the selected chat permanently (asks to confirm)
+  Ctrl+R       reload this script (pick up edits without restarting)
+  q            quit
+
+Copies of one chat show once: chats in a project with the same name AND shared
+history fold behind the one you typed in last, in any category ('a' shows them).
+A shared name alone never folds anything, and a badged or PAUSED chat never folds.
+
+Apart from that, nothing leaves this board unless filed **Done**. Reopening a
+finished chat starts a fresh background session, and Claude itself splits a full
+chat into a new session when it auto-compacts; the board links each of those to
+the chat it came from. It only FOLDS the older entry away when that chat is
+filed Done, anything In Progress / To Test / Later / Failed / Done, Not
+Committed / Uncategorized whose continuation has another name stays next to it,
+marked '⤷'. No chat file is ever
+deleted except by you, with 'd', after confirming. (The one knob:
+AUTO_FOLD_CATEGORIES near the top of this file.)
+
+Command line:
+  chats.py                 open the board
+  chats.py <proj>          open the board already filtered to that project, e.g.
+                           `claude-c system`. `proj` is free text matched against
+                           project names and folders (case-insensitive, prefix or
+                           substring): a display name, a folder basename, a path,
+                           or `all` for the unfiltered board.
+  chats.py <proj> -n       skip the board, create a background chat in `proj`
+  chats.py --new [proj]    and attach to it immediately (default project: System,
+                           i.e. the home folder). Ctrl+Z out of the chat lands on
+                           the board, in that project. This is exactly what
+                           Ctrl+Alt+Y runs (see bin/claude-new-chat). The flag
+                           may come before or after the project name, so
+                           `claude-c system -n` == `claude-c -n system`.
+  chats.py --list          print every project the CLI can be pointed at
+"""
+
+import contextlib
+import curses
+import fcntl
+import hashlib
+import json
+import shlex
+import locale
+import os
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import datetime
+import time
+import tty
+import unicodedata
+from pathlib import Path
+
+# Per-project colors (see projcolor.py). It sits next to this file; import it by
+# path so the board works whether it's run from ~/.claude/chats or the repo.
+# If it ever goes missing the board just falls back to its plain old colors.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import projcolor
+except Exception:
+    projcolor = None
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# --- bidi / display-width helpers ------------------------------------------
+# Chat names can mix Hebrew (RTL) with English (LTR). A row whose first strong
+# character is Hebrew makes the terminal flip the WHOLE line to RTL base
+# direction, so the trailing "[project]" tag jumps to the left and the layout
+# looks scrambled. Wrapping the name in directional isolates renders it
+# correctly on its own while leaving the surrounding LTR layout untouched.
+_FSI = "⁨"  # First Strong Isolate (auto-detects the run's direction)
+_PDI = "⁩"  # Pop Directional Isolate
+
+
+def _has_rtl(s):
+    return any(unicodedata.bidirectional(c) in ("R", "AL") for c in s)
+
+
+def _no_flow_control(fd=0):
+    """Stop the tty driver from eating Ctrl+S / Ctrl+Q as XOFF / XON, so the
+    board can bind Ctrl+S at all. Without this the keystroke never becomes a
+    keypress: it just SUSPENDS the terminal's output and the board looks frozen
+    (Ctrl+Q would be the only way out). Returns the previous attrs to restore,
+    or None if this isn't a real tty / the call failed. curses only touches
+    ICANON/ISIG (cbreak), so nothing later re-enables IXON behind our back."""
+    try:
+        old = termios.tcgetattr(fd)
+        new = list(old)
+        new[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return old
+    except Exception:
+        return None
+
+
+def _restore_flow_control(old, fd=0):
+    if old is None:
+        return
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+def _bidi(s):
+    """Isolate a possibly-RTL string so it can't flip the surrounding layout."""
+    return _FSI + s + _PDI if _has_rtl(s) else s
+
+
+def _cwidth(ch):
+    """Terminal columns a single character occupies (0 for zero-width marks)."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) == "Cf":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _dwidth(s):
+    return sum(_cwidth(c) for c in s)
+
+
+def _clamp(s, cols):
+    """Truncate s to at most `cols` display columns (counting zero-width as 0)."""
+    if cols <= 0:
+        return ""
+    out, used = [], 0
+    for ch in s:
+        w = _cwidth(ch)
+        if used + w > cols:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+def _wrap(s, cols):
+    """Split s into segments each <= `cols` display columns, breaking at spaces
+    when possible so the full string can be shown across several lines."""
+    if cols <= 0:
+        return [s]
+    out, cur = [], ""
+    for word in s.split(" "):
+        cand = (cur + " " + word) if cur else word
+        if _dwidth(cand) <= cols:
+            cur = cand
+            continue
+        if cur:
+            out.append(cur)
+            cur = ""
+        # A single word wider than the line is hard-split by display width.
+        while _dwidth(word) > cols:
+            head = _clamp(word, cols)
+            if not head:
+                break
+            out.append(head)
+            word = word[len(head):]
+        cur = word
+    if cur or not out:
+        out.append(cur)
+    return out
+
+locale.setlocale(locale.LC_ALL, "")
+
+_CODE_MTIME = os.stat(os.path.abspath(__file__)).st_mtime
+
+
+def _code_changed():
+    """True once this file on disk is newer than the code running now (and the
+    new file at least compiles, so a half-saved edit never kills the board)."""
+    try:
+        m = os.stat(os.path.abspath(__file__)).st_mtime
+        if m <= _CODE_MTIME or time.time() - m < 2:
+            return False
+        compile(open(os.path.abspath(__file__)).read(), __file__, "exec")
+        return True
+    except Exception:
+        return False
+
+HOME = Path.home()
+PROJECTS_DIR = HOME / ".claude" / "projects"
+# Chats that live on another machine (an ssh host). server-chats-sync
+# mirrors each host's transcripts (read-only) into REMOTE_DIR/<host>/projects and
+# its live agents into REMOTE_DIR/<host>/agents.json. The <host> dir name is the
+# ssh alias used to open them.
+REMOTE_DIR = HOME / ".claude" / "remote"
+REMOTE_STALE_S = 120  # ignore an agents.json older than this (host offline)
+
+
+def remote_project_roots():
+    """[(host, projects_dir)] for every mirrored host."""
+    if not REMOTE_DIR.is_dir():
+        return []
+    return [(h.name, h / "projects") for h in sorted(REMOTE_DIR.iterdir())
+            if (h / "projects").is_dir()]
+
+
+def remote_agents():
+    """sessionId -> record for live agents on every mirrored host. Each record
+    gets 'host' and 'config' (the remote CLAUDE_CONFIG_DIR, '' = default)."""
+    out = {}
+    for host, _ in remote_project_roots():
+        f = REMOTE_DIR / host / "agents.json"
+        try:
+            if time.time() - f.stat().st_mtime > REMOTE_STALE_S:
+                continue
+            groups = json.loads(f.read_text() or "[]")
+        except Exception:
+            continue
+        for g in groups:
+            for x in g.get("agents") or []:
+                if isinstance(x, dict) and x.get("sessionId"):
+                    rec = dict(x)
+                    rec["host"] = host
+                    rec["config"] = g.get("config") or ""
+                    out[x["sessionId"]] = rec
+    return out
+STORE = HOME / ".claude" / "chats" / "categories.json"
+
+# Category order shown on the board. "Uncategorized" is the landing bucket for
+# any chat you haven't filed yet; the 6 real categories map to number keys 1-6.
+UNCATEGORIZED = "Uncategorized"
+CATEGORIES = [
+    "In Progress",
+    "To Test",
+    "Later",
+    "Failed",
+    "Done, Not Committed",
+    "Done",
+]
+DISPLAY_ORDER = [UNCATEGORIZED] + CATEGORIES
+
+# The ONLY categories a chat may be folded from behind a continuation that has a
+# DIFFERENT name (same-named copies fold in any category, see Lineage). Everything else, In Progress, To Test, Later, Failed, Uncategorized, and
+# "Done, Not Committed" (its work isn't safe on a branch yet), stays on the
+# board forever unless YOU delete it with 'd'. The board never removes unfinished
+# work on its own; a duplicate row is cheap, a chat you can't find is not.
+AUTO_FOLD_CATEGORIES = {"Done"}
+
+# color pair index per category (filled in setup_colors)
+CAT_COLOR = {
+    UNCATEGORIZED: 1,
+    "In Progress": 9,  # blue
+    "To Test": 2,      # yellow
+    "Later": 3,
+    "Failed": 4,
+    "Done, Not Committed": 5,
+    "Done": 6,
+}
+
+
+def _load_json(path):
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _atomic_write_json(path, data):
+    """Write JSON atomically (temp file + rename) so a concurrent reader never
+    sees a partial file and a crash can't corrupt it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def _json_set(path, key, value):
+    """Locked read-modify-write of one key in a JSON dict file, so multiple
+    `claude-c` instances can't lose each other's edits. value=None deletes the
+    key. Returns the merged dict."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_name(f"{path.name}.lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            d = _load_json(path)
+            if value is None:
+                d.pop(key, None)
+            else:
+                d[key] = value
+            _atomic_write_json(path, d)
+            return d
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _json_update(path, fn):
+    """Locked read-modify-write of a whole JSON dict (fn mutates it in place)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_name(f"{path.name}.lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            d = _load_json(path)
+            fn(d)
+            _atomic_write_json(path, d)
+            return d
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def load_store():
+    return _load_json(STORE)
+
+
+# When each chat was last (re)filed into a category, as unix timestamps keyed by
+# session id. Used to float a freshly-moved chat to the top of its category, so an
+# accidental move lands somewhere visible instead of sinking into a big pile.
+MOVED_STORE = HOME / ".claude" / "chats" / "moved.json"
+
+
+def load_moved():
+    return _load_json(MOVED_STORE)
+
+
+PROJECTS_STORE = HOME / ".claude" / "chats" / "projects.json"
+COLLAPSE_STORE = HOME / ".claude" / "chats" / "collapsed.json"
+PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
+# Persisted user preferences for the board itself (not per-chat). Currently just
+# the default thinking level offered when creating a new chat, settable from the
+# effort picker with 'd<n>'.
+SETTINGS_STORE = HOME / ".claude" / "chats" / "settings.json"
+
+# Projects that must run on a DIFFERENT Claude account. Claude Code keeps one
+# login per config directory, so an account is really a config dir: this maps a
+# project key to the one its chats belong to (e.g. a work account in ~/.claude-work). Booting the board into such a project re-execs it with
+# CLAUDE_CONFIG_DIR set, so every `claude` it spawns (new chat, attach, resume,
+# `claude agents`) speaks to that account and not whichever one is default.
+# Deliberately its own file: the board rewrites projects.json wholesale from
+# memory whenever you touch the P panel, so a stale instance would drop it.
+PROJECT_CONFIG_DIRS_STORE = HOME / ".claude" / "chats" / "project_config_dirs.json"
+
+
+def config_dir_for_project(key):
+    """Expanded config dir bound to a project key, or None if it has none."""
+    if not key:
+        return None
+    raw = _load_json(PROJECT_CONFIG_DIRS_STORE).get(key)
+    if not raw:
+        return None
+    path = os.path.abspath(os.path.expanduser(raw))
+    return path if os.path.isdir(path) else None
+
+# old sessionId -> new sessionId for chats that were reopened by resuming them
+# into a fresh BACKGROUND agent (so Ctrl+Z detaches instead of killing the work).
+# Backgrounding always mints a new session id, so the old (pre-resume) entry is
+# hidden from the board to avoid showing the continuation as a duplicate.
+SUPERSEDED_STORE = HOME / ".claude" / "chats" / "superseded.json"
+
+
+def load_superseded():
+    # A chat can never supersede itself, and an entry saying it does hides a
+    # live chat from the board for good. Seven of those were found on
+    # 2026-09-02, three of them over chats that were running at the time.
+    return {k: v for k, v in _load_json(SUPERSEDED_STORE).items() if k != v}
+
+
+# Diagnostic tracing for the "Ctrl+Z sometimes stops a live agent" report.
+# OFF by default (zero overhead); `touch ~/.claude/chats/ctrlz-debug.on` to
+# enable, then reproduce and read ~/.claude/chats/ctrlz-debug.log. Each chat
+# open/return records the action taken, the child's exit, and, crucially -
+# whether Claude still considers the agent LIVE right before vs right after, so
+# we can tell a real Ctrl+Z stop apart from the daemon's ~5-min idle settle.
+CTRLZ_DEBUG_FLAG = HOME / ".claude" / "chats" / "ctrlz-debug.on"
+CTRLZ_DEBUG_LOG = HOME / ".claude" / "chats" / "ctrlz-debug.log"
+
+
+def _dbg(msg):
+    """Append a timestamped diagnostic line, but only while the debug flag file
+    exists. Best-effort: never let logging disturb the board."""
+    try:
+        if not CTRLZ_DEBUG_FLAG.exists():
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(CTRLZ_DEBUG_LOG, "a") as f:
+            f.write(f"[{stamp}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _agent_snapshot(full):
+    """(live, status, state) for a session id, from one authoritative query.
+    Used to tell apart a KILL (live -> gone) from an INTERRUPT (still live but
+    busy -> idle, i.e. the running turn was cancelled 'like Ctrl+C')."""
+    try:
+        rec = agents_active().get(full)
+    except Exception:
+        rec = None
+    if rec is None:
+        return (False, None, None)
+    return (True, rec.get("status"), rec.get("state"))
+
+
+BADGES_STORE = HOME / ".claude" / "chats" / "badges.json"
+_BADGES = {"mtime": None, "v": {}}
+
+
+def load_badges():
+    """sessionId -> a short badge shown before the chat title (the Cotube manager writes it:
+    every channel Claude gets its channel name). Re-read only when the file changes."""
+    try:
+        m = BADGES_STORE.stat().st_mtime
+    except OSError:
+        return {}
+    if m != _BADGES["mtime"]:
+        try:
+            _BADGES["v"] = json.loads(BADGES_STORE.read_text()) or {}
+        except Exception:
+            _BADGES["v"] = {}
+        _BADGES["mtime"] = m
+    return _BADGES["v"]
+
+
+def load_project_tags():
+    """sessionId -> project key override. Lets a chat live in a project other
+    than the one implied by its folder (e.g. grouping homework chats from several
+    folders under one 'HW' project). Empty file = every chat just uses its
+    folder, exactly like before this feature existed."""
+    return _load_json(PROJECT_TAGS_STORE)
+
+
+def project_key_for(chat, tags):
+    """Effective project key for a chat: an explicit per-chat tag wins, else the
+    chat's own working directory. The key is a real folder path for folder-based
+    projects, or a free virtual name (like 'HW') for tagged ones."""
+    return tags.get(chat["id"]) or chat.get("cwd") or "(unknown)"
+
+
+def project_candidates(deep=False):
+    """[(key, display name)] of every project the CLI can be pointed at.
+
+    Cheap by default: whatever projects.json knows about (added folders, virtual
+    projects with a cwd) plus every virtual project some chat is tagged into.
+    `deep=True` also parses the chat files to pick up folders that were never
+    added explicitly and only exist as some chat's working directory, that scan
+    costs real time, so it's only paid when the cheap list fails to match."""
+    pj = _load_json(PROJECTS_STORE)
+    listed = pj.get("list", {}) or {}
+    keys = dict.fromkeys(listed)                       # keep projects.json order
+    for k in (pj.get("cwds", {}) or {}):
+        keys.setdefault(k, None)
+    for k in load_project_tags().values():
+        if k:
+            keys.setdefault(k, None)
+    if deep:
+        for c in scan_chats():
+            k = c.get("cwd")
+            if k and k != "(unknown)":
+                keys.setdefault(k, None)
+    out = []
+    for k in keys:
+        name = listed.get(k) or (os.path.basename(k.rstrip("/"))
+                                 if os.path.isabs(k) else k)
+        out.append((k, name or k))
+    return out
+
+
+def _match_projects(arg, cands):
+    """Keys of `cands` matching `arg`, best tier only: exact name/key wins over
+    a prefix, which wins over a substring. Case- and accent-blind enough for
+    typing `claude-c system` at 2am."""
+    a = arg.casefold().strip()
+    if not a:
+        return []
+
+    def names(k, n):
+        yield n.casefold()
+        yield k.casefold()
+        if os.path.isabs(k):
+            yield os.path.basename(k.rstrip("/")).casefold()
+
+    for test in (lambda s: s == a,
+                 lambda s: s.startswith(a),
+                 lambda s: a in s):
+        hits = [k for k, n in cands if any(test(s) for s in names(k, n))]
+        if hits:
+            return list(dict.fromkeys(hits))
+    return []
+
+
+def resolve_project(arg):
+    """Map a free-text CLI argument to a project key.
+
+    Returns (ok, key, matches). `ok` False means nothing matched (or several did,
+    in which case `matches` holds the candidates to show). key None with ok True
+    is the "All projects" view. An existing folder path always resolves to
+    itself, so `claude-c .` or `claude-c ~/code/foo` work without the folder ever
+    having been added to the board."""
+    a = (arg or "").strip()
+    if a.casefold() in ("all", "-", "*"):
+        return True, None, []
+    p = os.path.abspath(os.path.expanduser(a))
+    if os.path.isdir(p) and (a.startswith(("/", "~", ".")) or os.sep in a):
+        return True, p, []
+
+    cands = project_candidates()
+    hits = _match_projects(a, cands)
+    if not hits:                       # only now pay for parsing every chat file
+        cands = project_candidates(deep=True)
+        hits = _match_projects(a, cands)
+    if len(hits) == 1:
+        return True, hits[0], []
+    named = {k: n for k, n in cands}
+    return False, None, [(k, named.get(k, k)) for k in hits]
+
+
+def _text_from_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "text":
+                parts.append(x.get("text", ""))
+            elif isinstance(x, dict) and "text" in x:
+                parts.append(x.get("text", ""))
+        return " ".join(parts)
+    return ""
+
+
+def _is_noise(text):
+    t = text.strip()
+    if not t:
+        return True
+    noise_prefixes = ("<command", "<system-reminder", "Caveat:", "<local-command",
+                      "[Request interrupted", "<bash-")
+    return t.startswith(noise_prefixes)
+
+
+COMPACT_MARKER = "This session is being continued"
+
+
+def _all_uuids(path):
+    """Every message uuid in a transcript. Only ever called for the handful of
+    unlinked compact-continuations, so the full read is affordable."""
+    out = set()
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("uuid"):
+                    out.add(d["uuid"])
+    except OSError:
+        pass
+    return out
+
+
+def _tail_last_uuid(path, tail=262144):
+    """The LAST message uuid, read from the end of the file so it stays cheap on a
+    multi-MB transcript. (A truncated first line just fails to parse and is skipped.)"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - tail))
+            chunk = fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    last = None
+    for line in chunk.split("\n"):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("uuid"):
+            last = d["uuid"]
+    return last
+
+
+def latest_titles(path):
+    """(latest /rename title, latest Claude ai-title) of a transcript. Claude
+    re-appends title lines all the time, so the latest sit near the end: read
+    only the tail."""
+    custom = ai = None
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - (1 << 20)))
+            for line in fh.read().decode("utf-8", "replace").splitlines():
+                if '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if d.get("customTitle"):
+                    custom = " ".join(str(d["customTitle"]).split())[:90]
+                elif d.get("aiTitle"):
+                    ai = " ".join(str(d["aiTitle"]).split())[:90]
+    except Exception:
+        pass
+    return custom, ai
+
+
+# --- same-named copies -----------------------------------------------------
+# Resume, fork and auto-continue each mint a new session id that starts with
+# copied messages, message uuids included. A shared uuid therefore proves two
+# rows are one chat, whoever made the copy and whether or not a link was saved.
+# The name alone proves nothing: about 1000 bot runs here share a first line.
+# Only a record's own uuid is matched (it is written right before timestamp),
+# never a "uuid" field inside some tool's result.
+_OWN_UUID_RE = re.compile(rb'"uuid": ?"([0-9a-f-]{36})", ?"timestamp"')
+_NOT_TYPED = ("<task-notification", "[SYSTEM", "Another Claude session",
+              "<agent-message", COMPACT_MARKER)
+
+
+class Lineage:
+    """Which same-named chats are copies, and which one was typed in last.
+
+    Both answers are cached on disk, so a board start or auto-reload does not
+    re-read a gigabyte of transcripts."""
+
+    def __init__(self):
+        self.file = HOME / ".cache" / "claude-c" / "lineage.json"
+        d = _load_json(self.file)
+        self.groups = d.get("groups", {})      # signature -> [component number]
+        self.activity = d.get("activity", {})  # path -> [offset, typed, last]
+        self.dirty = False
+
+    def components(self, members, links):
+        """Split same-named chats into the sets that really are one chat."""
+        members = sorted(members, key=lambda c: str(c["path"]))
+        h = hashlib.sha1()
+        for c in members:
+            try:
+                size = c["path"].stat().st_size
+            except OSError:
+                size = 0
+            # bit_length: look again each time a file doubles, so a transcript
+            # that was still being mirrored when first seen gets linked later.
+            h.update(f"{c['path']}:{size.bit_length()};".encode())
+        sig = h.hexdigest()
+        root = list(range(len(members)))
+
+        def find(i):
+            while root[i] != i:
+                root[i] = root[root[i]]
+                i = root[i]
+            return i
+
+        known = self.groups.get(sig)
+        if known is None or len(known) != len(members):
+            owner = {}
+            for i, c in enumerate(members):
+                try:
+                    with c["path"].open("rb") as fh:
+                        for line in fh:
+                            for u in _OWN_UUID_RE.findall(line):
+                                root[find(i)] = find(owner.setdefault(u, i))
+                except OSError:
+                    pass
+            self.groups[sig] = [find(i) for i in range(len(members))]
+            self.dirty = True
+        else:
+            root[:] = known
+        at = {c["id"]: i for i, c in enumerate(members)}
+        for c in members:  # a recorded continuation counts as proof too
+            seen, nxt = set(), links.get(c["id"])
+            while nxt and nxt not in seen:
+                seen.add(nxt)
+                if nxt in at:
+                    root[find(at[c["id"]])] = find(at[nxt])
+                nxt = links.get(nxt)
+        out = {}
+        for i, c in enumerate(members):
+            out.setdefault(find(i), []).append(c)
+        return [v for v in out.values() if len(v) > 1]
+
+    def recency(self, c):
+        """Sort key: when he last typed here, then the last message. File mtime
+        only breaks ties, because Claude touches idle transcripts all the time."""
+        key = str(c["path"])
+        off, typed, last = self.activity.get(key, (0, "", ""))
+        try:
+            size = c["path"].stat().st_size
+            if size < off:
+                off, typed, last = 0, "", ""
+            if size > off:
+                with c["path"].open("rb") as fh:
+                    fh.seek(off)
+                    for line in fh:
+                        if not line.endswith(b"\n"):
+                            break  # still being written
+                        off += len(line)
+                        try:
+                            d = json.loads(line)
+                            ts = d.get("timestamp") or ""
+                            kind = d.get("type")
+                        except Exception:
+                            continue
+                        if not ts or d.get("isSidechain"):
+                            continue
+                        text = ""
+                        if kind in ("user", "assistant"):
+                            last = max(last, ts)
+                        if kind == "user" and not (d.get("isMeta") or d.get("isCompactSummary")):
+                            text = _text_from_content((d.get("message") or {}).get("content"))
+                        elif kind == "attachment":  # typed while a turn was running
+                            a = d.get("attachment") or {}
+                            if a.get("commandMode") == "prompt":
+                                text = _text_from_content(a.get("prompt"))
+                        text = text.strip()
+                        if text and not _is_noise(text) and not text.startswith(_NOT_TYPED):
+                            typed = max(typed, ts)
+                self.activity[key] = [off, typed, last]
+                self.dirty = True
+        except OSError:
+            pass
+        return (typed or last, last, c["mtime"])
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            self.file.parent.mkdir(parents=True, exist_ok=True)
+            if len(self.groups) > 3000:  # old signatures; rebuilt when needed
+                self.groups = dict(list(self.groups.items())[-1500:])
+            tmp = self.file.with_suffix(f".tmp{os.getpid()}")
+            tmp.write_text(json.dumps({"groups": self.groups, "activity": self.activity}))
+            os.replace(tmp, self.file)
+            self.dirty = False
+        except OSError:
+            pass
+
+
+def parse_chat(path):
+    """Return dict(id, cwd, title, ai_title, mtime) or None if unreadable/empty."""
+    session_id = path.stem
+    cwd = None
+    title = None
+    ai_title = None
+    try:
+        with path.open() as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if cwd is None and d.get("cwd"):
+                    cwd = d["cwd"]
+                # Claude's own generated session name lives on an "ai-title" line.
+                if ai_title is None and d.get("type") == "ai-title" and d.get("aiTitle"):
+                    ai_title = " ".join(str(d["aiTitle"]).split())[:90]
+                if title is None and d.get("type") == "user":
+                    txt = _text_from_content(d.get("message", {}).get("content"))
+                    if not _is_noise(txt):
+                        title = " ".join(txt.split())[:90]
+                if cwd is not None and title is not None and ai_title is not None:
+                    break
+    except Exception:
+        return None
+    if title is None:
+        title = "(no readable messages)"
+    custom_title = latest_titles(path)[0]
+    return {
+        "id": session_id,
+        "cwd": cwd or "(unknown)",
+        "title": title,
+        "ai_title": ai_title,
+        "custom_title": custom_title,
+        # Claude auto-continues a full chat in a NEW session whose first message is
+        # its "continued from a previous conversation" summary. Free to detect here
+        # (it's just the first user text we already read) and the only signal that
+        # separates a real auto-continuation from a fork/copy, which starts with the
+        # original's own first message instead.
+        "compact_child": title.startswith(COMPACT_MARKER),
+        "mtime": path.stat().st_mtime,
+        "path": path,
+    }
+
+
+# parse_chat results keyed by path, reused while (mtime, size) is unchanged. With
+# thousands of kept transcripts a cold scan reads ~20 s of JSON; cached it is <1 s.
+_PARSE_CACHE_FILE = HOME / ".claude" / "chats" / "parse_cache.json"
+_parse_cache = None
+_parse_cache_dirty = False
+
+
+def _cached_parse(f):
+    global _parse_cache, _parse_cache_dirty
+    if _parse_cache is None:
+        try:
+            _parse_cache = json.loads(_PARSE_CACHE_FILE.read_text())
+        except Exception:
+            _parse_cache = {}
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = str(f)
+    hit = _parse_cache.get(key)
+    if (hit and hit[0] == st.st_mtime and hit[1] == st.st_size
+            and "custom_title" in hit[2]):
+        c = dict(hit[2])
+        c["path"] = f
+        return c
+    c = parse_chat(f)
+    if c:
+        _parse_cache[key] = [st.st_mtime, st.st_size,
+                             {k: v for k, v in c.items() if k != "path"}]
+        _parse_cache_dirty = True
+    return c
+
+
+def _save_parse_cache():
+    global _parse_cache_dirty
+    if not _parse_cache_dirty:
+        return
+    try:
+        tmp = _PARSE_CACHE_FILE.with_suffix(".tmp%d" % os.getpid())
+        tmp.write_text(json.dumps(_parse_cache))
+        os.replace(tmp, _PARSE_CACHE_FILE)
+        _parse_cache_dirty = False
+    except OSError:
+        pass
+
+
+def scan_chats():
+    chats = []
+    if not PROJECTS_DIR.exists():
+        return chats
+    for proj in PROJECTS_DIR.iterdir():
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            c = _cached_parse(f)
+            if c:
+                chats.append(c)
+    remote_ids = set()
+    for host, root in remote_project_roots():
+        for proj in root.iterdir():
+            if not proj.is_dir():
+                continue
+            for f in proj.glob("*.jsonl"):
+                c = _cached_parse(f)
+                if c:
+                    c["host"] = host
+                    remote_ids.add(c["id"])
+                    chats.append(c)
+    _save_parse_cache()
+    chats = [c for c in chats if c.get("host") or c["id"] not in remote_ids]
+    chats.sort(key=lambda c: c["mtime"], reverse=True)
+    return chats
+
+
+JOBS_DIR = HOME / ".claude" / "jobs"
+# Claude's own settings file. It lives beside the config dir in use, so a board
+# running on an alternate account (CLAUDE_CONFIG_DIR, a second board) marks
+# folders trusted in THAT account's file instead of the main one's, otherwise
+# every chat it opens re-asks "do you trust this folder?".
+_CFG_DIR = os.environ.get("CLAUDE_CONFIG_DIR")
+CLAUDE_JSON = (Path(os.path.expanduser(_CFG_DIR)) / ".claude.json"
+               if _CFG_DIR else HOME / ".claude.json")
+
+# live Claude-side status -> (icon glyph, color pair)
+STATUS_ICON = {
+    "running":     ("●", 9),  # blue   , in progress / actively working
+    "needs_input": ("◆", 2),  # yellow , waiting on you
+    "done":        ("✓", 6),  # green  , finished
+    "failed":      ("✗", 4),  # red    , errored out
+    "unknown":     ("·", 8),  # dim    , no signal / closed
+}
+
+# Running chats get a moving-dot animation; everything else is a static glyph.
+# All cells are exactly 3 columns wide so titles stay aligned.
+_RUN_FRAMES = ("●··", "·●·", "··●", "·●·")
+
+
+def status_cell(status, frame):
+    if status == "running":
+        return _RUN_FRAMES[frame % len(_RUN_FRAMES)]
+    return f"{STATUS_ICON.get(status, STATUS_ICON['unknown'])[0]}  "
+
+
+AGENTS_SHARED_TTL = 2.5
+
+
+def _agents_cache_path():
+    # One cache per config dir: a second-account board runs with its own CLAUDE_CONFIG_DIR.
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", cfg).strip("_") or "default"
+    return os.path.expanduser(f"~/.cache/claude-c/agents-{tag}.json")
+
+
+def agents_active(shared=False):
+    """Authoritative set of currently-live background agents, straight from
+    Claude itself. These are exactly the sessions `claude --resume` refuses
+    (must fork/attach). Returns sessionId -> record. Empty on any failure.
+
+    shared=True lets every open board reuse one result for AGENTS_SHARED_TTL.
+    Each call boots a full `claude` (~1 CPU-s, ~180 MB), and on 2026-09-27
+    twelve open boards were each doing that every 2.5s: about a core and a
+    steady spawn storm on an already swapping laptop, just to poll."""
+    data = None
+    cache = _agents_cache_path()
+    if shared:
+        try:
+            if time.time() - os.path.getmtime(cache) < AGENTS_SHARED_TTL:
+                with open(cache) as f:
+                    data = json.load(f)
+        except Exception:
+            data = None
+    if data is None:
+        try:
+            out = subprocess.run(["claude", "agents", "--json"],
+                                 capture_output=True, text=True, timeout=8)
+            if out.returncode != 0:
+                return {}
+            data = json.loads(out.stdout or "[]")
+        except Exception:
+            return {}
+        try:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            tmp = f"{cache}.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, cache)
+        except Exception:
+            pass
+    live = {x["sessionId"]: x for x in data
+            if isinstance(x, dict) and x.get("sessionId")}
+    for sid, rec in remote_agents().items():
+        live.setdefault(sid, rec)
+    return live
+
+
+def session_file(full_id):
+    """Path to a session's transcript on disk, or None. A freshly bg-resumed
+    agent writes NO file until it actually produces a turn, so absence here means
+    'opened but nothing was written'."""
+    if not full_id:
+        return None
+    for f in PROJECTS_DIR.glob(f"*/{full_id}.jsonl"):
+        return f
+    for _, root in remote_project_roots():
+        for f in root.glob(f"*/{full_id}.jsonl"):
+            return f
+    return None
+
+
+# Cache keyed by (path, size, mtime) so hovering up and down a list of chats does not
+# re-read a transcript per keypress. Transcripts only ever grow, so this is exact.
+_STATUS_TAG_CACHE = {}
+
+# A status tag is the CAPS line the assistant is told to end every message with
+# (see ~/.claude/CLAUDE.md): DONE DONE, MUST REPLY, DONE BUT MUST READ, and so on.
+# Deliberately strict - all-caps words, no lowercase - so an ordinary shouted
+# sentence or a bare acronym in the prose does not get mistaken for a verdict.
+_STATUS_TAG_RE = re.compile(r"^[A-Z][A-Z0-9 ·,'\u2014\u2013()/&+-]{2,60}$")
+
+
+def last_status_tag(full_id):
+    """The CAPS status tag the last assistant turn signed off with, or None.
+
+    Reads only the TAIL of the transcript: these files reach tens of megabytes on a
+    long chat and the answer is always within the last turn or two. Scans backwards
+    and stops at the first assistant message that ends in a tag.
+    """
+    f = session_file(full_id)
+    if not f:
+        return None
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = (str(f), st.st_size, st.st_mtime_ns)
+    if key in _STATUS_TAG_CACHE:
+        return _STATUS_TAG_CACHE[key]
+
+    tag = None
+    looked = 0
+    try:
+        with f.open("rb") as fh:
+            # 512 KB of tail comfortably covers several long turns; a transcript
+            # smaller than that is simply read whole.
+            back = min(st.st_size, 512 * 1024)
+            fh.seek(st.st_size - back)
+            chunk = fh.read().decode("utf-8", "replace")
+        lines = chunk.splitlines()
+        # A partial first line is likely when we seeked into the middle of one.
+        for line in reversed(lines[1:] if back < st.st_size else lines):
+            line = line.strip()
+            if not line or '"assistant"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            content = (rec.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            text = "".join(b.get("text", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text")
+            if not text.strip():
+                continue  # a pure tool-use turn signs nothing
+            last = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+            if last and _STATUS_TAG_RE.match(last[-1]):
+                tag = last[-1]
+                break
+            # No tag on this one, so look further back - but not far. A long working turn
+            # ends in narration ("running the build now…") with the real verdict several
+            # turns behind it, and a chat from before the sign-off rule existed has none at
+            # all. Fourteen turns clears a long tool-heavy stretch without dredging up a
+            # verdict old enough to be a lie.
+            looked += 1
+            if looked >= 14:
+                break
+    except Exception:
+        tag = None
+
+    _STATUS_TAG_CACHE[key] = tag
+    if len(_STATUS_TAG_CACHE) > 512:
+        _STATUS_TAG_CACHE.clear()
+    return tag
+
+
+def session_has_user_turn(full_id):
+    """True only if this session's transcript contains a genuine user message -
+    not merely an auto 'continued from a previous conversation' summary turn. Used
+    to decide whether a resume produced real content (so it should supersede the
+    original) or was opened and abandoned (so we must NOT hide the original)."""
+    f = session_file(full_id)
+    if not f:
+        return False
+    try:
+        for line in f.open():
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "user":
+                continue
+            text = _text_from_content((o.get("message") or {}).get("content"))
+            if text and not text.startswith("This session is being continued"):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def job_tempo_map():
+    """sessionId -> (state, tempo) from job state files, for richer status
+    (the 'blocked' tempo is how we detect 'needs input')."""
+    m = {}
+    if JOBS_DIR.exists():
+        for d in JOBS_DIR.iterdir():
+            sf = d / "state.json"
+            if not sf.exists():
+                continue
+            try:
+                s = json.loads(sf.read_text())
+            except Exception:
+                continue
+            sid = s.get("sessionId")
+            if sid:
+                m[sid] = (s.get("state"), s.get("tempo"))
+    return m
+
+
+def _headless_turn(a):
+    """Is this record a `claude --resume <id> -p` turn actually in flight?
+
+    A chat woken by claude-resume / quota-watcher runs headless: it registers
+    as `kind: interactive` with a pid but NO state and NO status, so the board
+    read it as an idle, finished chat while it was in fact working - the chat
+    only looked alive once it was opened. A terminal session he is sitting in
+    looks identical in the JSON, so the process itself is asked: a print run
+    carries -p / --print on its command line, an open terminal does not."""
+    if a.get("kind") != "interactive" or a.get("id"):
+        return False
+    pid = a.get("pid")
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            args = fh.read().split(b"\0")
+    except (OSError, ValueError):
+        return False
+    return b"-p" in args or b"--print" in args
+
+
+def headless_holder(full_id, active):
+    """PID of the headless `claude --resume <id> -p` run that owns this session,
+    or None.
+
+    This is the state that used to make a chat simply refuse to open. A session
+    revived with `--resume ... -p` registers as a live agent (so the board forces
+    the attach path) but it is a PRINT run: it has no pty host and no claim
+    socket, so it exposes no agent `id` and `claude attach` answers "this session
+    is running in another terminal" and drops you straight back to the board with
+    no explanation. Nothing is broken and nothing is recoverable by retrying:
+    the chat is simply owned by a process you cannot talk to, until it exits.
+
+    Detected by the two things that are always true of it together: the live
+    record carries no attachable `id`, and the process behind it has -p/--print
+    on its command line (a terminal session he is sitting in has neither)."""
+    rec = active.get(full_id)
+    if not rec or rec.get("id") or rec.get("host"):
+        return None
+    pid = rec.get("pid")
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            args = fh.read().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    if b"-p" not in args and b"--print" not in args:
+        return None
+    return int(pid)
+
+
+def headless_holder_age(pid):
+    """Human 'for 3h12m' for how long a headless holder has been running."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            fields = fh.read().rsplit(b")", 1)[1].split()
+        start_ticks = int(fields[19])
+        with open("/proc/uptime") as fh:
+            up = float(fh.read().split()[0])
+        secs = int(up - start_ticks / os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        return "?"
+    h, m = divmod(max(secs, 0) // 60, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _pid_alive(pid):
+    """Is this pid a process that is still running?
+
+    `os.kill(pid, 0)` is not enough on its own: a process that has exited but
+    not yet been reaped stays addressable as a zombie, so signal-0 keeps saying
+    "alive" for something that is very much dead. Read the state field out of
+    /proc instead and count Z (and the dying X/x) as gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            state = fh.read().rsplit(b")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state not in (b"Z", b"X", b"x")
+
+
+def kill_headless_holder(pid, timeout=20):
+    """End a headless holder so the session can be reopened properly. SIGTERM
+    first (it gets to flush its transcript), SIGKILL only if it will not go."""
+    if not _pid_alive(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return True  # already gone
+    for _ in range(timeout * 2):
+        time.sleep(0.5)
+        if not _pid_alive(pid):
+            return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return True
+    for _ in range(10):
+        time.sleep(0.3)
+        if not _pid_alive(pid):
+            return True
+    return False
+
+
+def resolve_status(sid, active, jobs):
+    """Status icon for a chat. running/needs_input only count if the session is
+    genuinely a live agent (in `active`); otherwise it's closed -> done/failed."""
+    if sid in active:
+        state, tempo = jobs.get(sid, (None, None))
+        if tempo == "blocked":
+            return "needs_input"
+        if tempo == "active":
+            return "running"
+        a = active[sid]
+        if a.get("status") == "busy":
+            return "running"
+        if _headless_turn(a):
+            return "running"
+        if a.get("state") == "failed" or state == "failed":
+            return "failed"
+        return "done"  # live agent, just idle
+    state, _ = jobs.get(sid, (None, None))
+    if state == "failed":
+        return "failed"
+    return "done"
+
+
+def short_id(full_id, active):
+    """The 8-char id `claude attach`/`claude stop` expect (not the full UUID)."""
+    rec = active.get(full_id)
+    if rec and rec.get("id"):
+        return rec["id"]
+    return full_id.split("-")[0]
+
+
+def stop_agent(short):
+    """Stop a background agent via Claude's own command. Returns True on success
+    (or if it was already gone)."""
+    try:
+        out = subprocess.run(["claude", "stop", short],
+                             capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    txt = (out.stdout + out.stderr).lower()
+    return out.returncode == 0 or "stopped" in txt or "no job matching" in txt
+
+
+def ensure_trusted(cwd):
+    """Mark a directory as trusted in ~/.claude.json so Claude doesn't show the
+    'do you trust this folder?' dialog on every launch. Locked + atomic so
+    parallel `claude-c` launches (and Claude itself) don't corrupt the file."""
+    if not cwd or not os.path.isdir(cwd) or not CLAUDE_JSON.exists():
+        return
+    # Fast path: already trusted -> no write, no lock.
+    try:
+        d = json.loads(CLAUDE_JSON.read_text())
+        if d.get("projects", {}).get(cwd, {}).get("hasTrustDialogAccepted") is True:
+            return
+    except Exception:
+        return
+    lock = CLAUDE_JSON.with_name(f"{CLAUDE_JSON.name}.lock")
+    try:
+        with open(lock, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                d = json.loads(CLAUDE_JSON.read_text())  # re-read under lock
+                entry = d.setdefault("projects", {}).setdefault(cwd, {})
+                if entry.get("hasTrustDialogAccepted") is True:
+                    return
+                entry["hasTrustDialogAccepted"] = True
+                _atomic_write_json(CLAUDE_JSON, d)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+NAMES_STORE = HOME / ".claude" / "chats" / "names.json"
+SEEN_TITLES_STORE = HOME / ".claude" / "chats" / "seen_titles.json"
+_SEEN = {"mtime": None, "v": {}}
+
+
+def load_seen_titles():
+    """sessionId -> Claude's title when you last left that chat. Re-read only
+    when the file changes."""
+    try:
+        m = SEEN_TITLES_STORE.stat().st_mtime
+    except OSError:
+        return {}
+    if m != _SEEN["mtime"]:
+        _SEEN["v"] = _load_json(SEEN_TITLES_STORE)
+        _SEEN["mtime"] = m
+    return _SEEN["v"]
+
+
+def remember_title(path, *ids):
+    """Pin the chat's current Claude title (read fresh from its transcript) as
+    the name the board keeps showing until you next leave it."""
+    ai = latest_titles(path)[1]
+    if ai:
+        for sid in ids:
+            _json_set(SEEN_TITLES_STORE, sid, ai)
+
+# sessionId -> True for chats you starred ('s'). A star doesn't move the chat;
+# it just paints the row's background so it jumps out wherever it sits.
+STARRED_STORE = HOME / ".claude" / "chats" / "starred.json"
+
+# sessionId -> True for chats you marked special ('s' twice). Deliberately a
+# SEPARATE store and a much quieter mark than the star: a star is loud because
+# it means "this needs you", while special means "keep this one around, I may
+# want it years from now". Both are folded in by the Ctrl+S marked-only filter.
+SPECIAL_STORE = HOME / ".claude" / "chats" / "special.json"
+
+
+# sessionId -> epoch seconds when /pause was run in that chat. The loudest mark
+# on the board: a red bar reading PAUSED, so a parked chat can't be mistaken
+# for one that is still working. It clears itself the moment you type a new
+# message into that chat (see _typed_since), or with `claude-c-file unpause`.
+PAUSED_STORE = HOME / ".claude" / "chats" / "paused.json"
+
+
+def load_paused():
+    return _load_json(PAUSED_STORE)
+
+
+def _typed_since(path, since):
+    """True when the transcript has a message YOU typed after `since` (epoch s).
+    Reads only the tail; slash commands, reminders and agent notifications do
+    not count, so the /pause itself never un-pauses the chat."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 262144))
+            chunk = fh.read().decode(errors="replace")
+    except OSError:
+        return False
+    for line in reversed(chunk.split("\n")):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isMeta"):
+            continue
+        txt = _text_from_content(d.get("message", {}).get("content")).strip()
+        if _is_noise(txt) or txt.startswith(("<task-notification", "[SYSTEM", "Another Claude session", "<agent-message")):
+            continue
+        ts = d.get("timestamp")
+        try:
+            when = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        return when > since + 5
+    return False
+
+
+def load_names():
+    return _load_json(NAMES_STORE)
+
+
+def load_starred():
+    return _load_json(STARRED_STORE)
+
+
+def load_special():
+    return _load_json(SPECIAL_STORE)
+
+
+def claude_names():
+    """sessionId -> Claude's own auto-generated session name (from job files)."""
+    m = {}
+    if JOBS_DIR.exists():
+        for d in JOBS_DIR.iterdir():
+            sf = d / "state.json"
+            if not sf.exists():
+                continue
+            try:
+                s = json.loads(sf.read_text())
+            except Exception:
+                continue
+            sid, name = s.get("sessionId"), s.get("name")
+            if sid and name:
+                m[sid] = name
+    return m
+
+
+def setup_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_WHITE, -1)    # Uncategorized
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # In Progress
+    curses.init_pair(3, curses.COLOR_CYAN, -1)     # Later
+    curses.init_pair(4, curses.COLOR_RED, -1)      # Failed
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # Done, Not Committed
+    curses.init_pair(6, curses.COLOR_GREEN, -1)    # Done
+    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selection
+    curses.init_pair(8, curses.COLOR_WHITE, -1)    # dim/help
+    curses.init_pair(9, curses.COLOR_BLUE, -1)     # In Progress / running
+    curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # starred row
+    curses.init_pair(11, curses.COLOR_YELLOW, curses.COLOR_RED)    # paused row
+    _PROJ_PAIRS.clear()          # pair numbers don't survive a new curses screen
+    _NEXT_PROJ_PAIR[0] = _PROJ_PAIR_BASE
+
+
+# --- per-project colors on the board ---------------------------------------
+# Every project gets its own color (projcolor.py). curses addresses colors by
+# palette index and pairs by number, so each project color costs two pairs -
+# one to write text in it, one to fill a chip with it, allocated on first use
+# from 20 up (1-10 are the category/status pairs above).
+_PROJ_PAIR_BASE = 20
+_NEXT_PROJ_PAIR = [_PROJ_PAIR_BASE]
+_PROJ_PAIRS = {}   # '#RRGGBB' -> (text_pair, chip_pair)
+
+
+def _proj_pairs(hexcolor):
+    """(text_pair, chip_pair) for a project color, or None when this terminal
+    can't do 256 colors (or we've run out of pair slots), callers then fall
+    back to the board's plain styling."""
+    if not hexcolor:
+        return None
+    hit = _PROJ_PAIRS.get(hexcolor)
+    if hit is not None:
+        return hit
+    try:
+        if curses.COLORS < 256 or _NEXT_PROJ_PAIR[0] + 1 >= curses.COLOR_PAIRS:
+            _PROJ_PAIRS[hexcolor] = None
+            return None
+        idx = projcolor.xterm256(hexcolor)
+        text_p = _NEXT_PROJ_PAIR[0]
+        chip_p = text_p + 1
+        _NEXT_PROJ_PAIR[0] += 2
+        curses.init_pair(text_p, idx, -1)
+        curses.init_pair(chip_p, curses.COLOR_BLACK, idx)
+    except Exception:
+        _PROJ_PAIRS[hexcolor] = None
+        return None
+    _PROJ_PAIRS[hexcolor] = (text_p, chip_p)
+    return _PROJ_PAIRS[hexcolor]
+
+
+def proj_attr(hexcolor, chip=False, extra=0):
+    """curses attribute that paints something in a project's color: as text, or
+    (chip=True) as a filled bar with black lettering. A_NORMAL if unavailable."""
+    pairs = _proj_pairs(hexcolor)
+    if not pairs:
+        return (curses.A_REVERSE | extra) if chip else (curses.A_NORMAL | extra)
+    return curses.color_pair(pairs[1] if chip else pairs[0]) | extra
+
+
+# --- terminal accent (the cue you get while you're INSIDE a chat) ----------
+# The board can't draw anything once claude takes over the screen, so instead it
+# tints the terminal itself on the way in and puts it back on the way out: the
+# text cursor takes the project's color (OSC 12), and, only if you opt in via
+# "background": true in project_colors.json, the background shifts a few
+# percent toward it too (OSC 11). Both are ignored harmlessly by terminals that
+# don't support them.
+_ACCENT_ON = {"cursor": False, "background": False}
+
+
+def set_terminal_accent(hexcolor):
+    if not (projcolor and hexcolor):
+        return
+    seq = ""
+    try:
+        if projcolor.option("cursor"):
+            seq += f"\033]12;{hexcolor}\007"
+            _ACCENT_ON["cursor"] = True
+        if projcolor.option("background"):
+            strength = float(projcolor.option("background_strength") or 0.1)
+            seq += f"\033]11;{projcolor.mix('#000000', hexcolor, strength)}\007"
+            _ACCENT_ON["background"] = True
+        if seq:
+            os.write(sys.stdout.fileno(), seq.encode())
+    except Exception:
+        pass
+
+
+def set_window_title(chat_id=None):
+    """Stamp the chat id into the terminal's window title (OSC 2).
+
+    This is how `claude-session` matches a restored terminal back to the column
+    it used to occupy: the Terminal Tiler records window titles when the
+    session ends, and the id is the only thing in a title that identifies a
+    conversation. Harmless anywhere else, every terminal accepts OSC 2, and
+    terminals that don't just ignore it."""
+    try:
+        text = f"claude-c {chat_id}" if chat_id else "claude-c"
+        os.write(sys.stdout.fileno(), f"\033]2;{text}\007".encode())
+    except Exception:
+        pass
+
+
+def clear_terminal_accent():
+    """Put the cursor (and background) back the way the terminal had them. Run
+    on every return from a chat, so a killed or crashed chat can't leave the
+    terminal wearing some project's color. Undoes exactly what was set, so
+    flipping an option mid-chat can't strand a tint."""
+    try:
+        seq = ""
+        if _ACCENT_ON["cursor"]:
+            seq += "\033]112\007"                  # reset cursor color
+        if _ACCENT_ON["background"]:
+            seq += "\033]111\007"                  # reset background color
+        if seq:
+            os.write(sys.stdout.fileno(), seq.encode())
+    except Exception:
+        pass
+    _ACCENT_ON.update(cursor=False, background=False)
+
+
+# Sentinel for App(select_project=...). _KEEP_PROJECT means "this is a fresh
+# launch, use whatever active project is persisted." Any other value (including
+# None, which means the 'All projects' view) means "restore EXACTLY this project."
+# Returning from a chat passes the board's own project so Ctrl+Z never moves you.
+_KEEP_PROJECT = object()
+
+
+class App:
+    def __init__(self, stdscr, select_id=None, select_project=_KEEP_PROJECT,
+                 auto_open=False):
+        self.stdscr = stdscr
+        self.store = load_store()
+        self.names = load_names()  # sessionId -> user's custom name
+        self.starred = load_starred()  # sessionId -> True (highlighted row)
+        self.special = load_special()  # sessionId -> True (quiet ♡ keepsake mark)
+        self.paused = load_paused()    # sessionId -> paused-at (loud red PAUSED bar)
+        # Ctrl+S: show only ★/♡ chats. Session-only on purpose (NOT persisted
+        # like show_hidden): a filter that survives a restart would reopen the
+        # board looking like most of the chats had vanished.
+        self.marked_only = False
+        self.moved = load_moved()  # sessionId -> ts it was last (re)filed
+        self.superseded_map = load_superseded()   # old id -> continuation id (bg-resume)
+        self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
+        self.kept_superseded = set()  # superseded but NOT Done -> shown anyway ('⤷')
+        self._autolink_tried = set()  # compact children we've already tried to link
+        self.lineage = Lineage()
+        self.folded = {}           # older copy -> the same-named copy shown instead
+        self.show_older = False    # 'a'
+        self._last_move = None     # (id, prev_cat, prev_ts), for `u` undo
+        self._search = ""          # last `/` query, so / repeats find the next hit
+        self._chat_cache = {}   # path -> parsed chat dict (title/cwd are stable)
+        self.all_chats = []
+        self.tags = load_project_tags()  # sessionId -> project key override (rescan needs it)
+        self.rescan()           # populate self.all_chats from disk
+        self.live = {}          # sessionId -> status icon key
+        self.live_ids = set()   # sessions Claude treats as live agents
+        self.cnames = {}        # sessionId -> Claude's auto name
+        self._agents = {}       # cached agents_active() result
+        self._agents_ts = 0.0
+        self.anim = 0           # animation frame counter (running-dot spinner)
+        self._live_ts = 0.0     # last status-data refresh time
+        self._scan_ts = 0.0     # last chat-file rescan time
+        self._reselect_id = None  # keep cursor on this chat after a rescan
+        self._resize_settle = 0.0  # >0 = a resize is in flight; clear+repaint when it lands
+        self.refresh_live(force=True)
+        pj = _load_json(PROJECTS_STORE)
+        self.projects_added = pj.get("list", {})   # key -> custom display name
+        self.project_cwds = pj.get("cwds", {})     # virtual project key -> default cwd
+        # Projects you've hidden ('h' in the P panel): they drop out of the
+        # projects list and their chats drop out of the "All projects" board, so
+        # one-off folders stop cluttering the view. Nothing is deleted: Ctrl+H
+        # in the panel reveals them again, and 'h' unhides the selected one.
+        self.hidden_projects = set(pj.get("hidden", []))
+        self.show_hidden = bool(pj.get("show_hidden", False))
+        if "active" not in pj:                      # first run -> default to home
+            self.active_project = str(HOME)
+        else:                                       # "__all__" means user chose All
+            a = pj["active"]
+            self.active_project = None if a in (None, "__all__") else a
+        # Returning from a chat (Ctrl+Z/detach/exit) restores the EXACT project
+        # the board was showing when the chat was opened, NEVER the chat's own
+        # project. (Snapping to the chat's project was jarring: Ctrl+Z from a
+        # chat dumped you onto a different project screen than the one you left.)
+        # _KEEP_PROJECT = a fresh launch, so use the persisted active set above;
+        # any other value (including None for "All projects") = restore it verbatim.
+        if select_project is not _KEEP_PROJECT:
+            self.active_project = select_project
+            self._save_projects()
+        self.collapsed = set(_load_json(COLLAPSE_STORE).get("collapsed", []))
+        self.start_cwd = os.environ.get("CHATS_LAUNCH_CWD") or os.getcwd()
+        self.sel = 0           # index into self.flat (chat rows only)
+        self.scroll = 0
+        self.message = ""
+        self.resume_target = None  # set on Enter -> handled after curses ends
+        self.resume_action = "resume"  # 'resume' | 'fork' | 'attach'
+        self.new_chat = False  # set on 'n' -> start a fresh session
+        self.reload = False  # set on 'r' -> re-exec the script to pick up edits
+        self._want_select = select_id  # reposition cursor here on first draw
+        self._positioned = False
+        # Session restore (`claude-c --open <id>`): open that chat immediately,
+        # as if the user had pressed Enter on it, so a restored terminal comes
+        # back showing the conversation rather than the board. Going through the
+        # normal Enter path means live agents attach and dead ones resume,
+        # exactly as they would by hand.
+        self._auto_open = bool(auto_open and select_id)
+        self._select_tries = 0   # the chat list can still be loading pass 1
+        self._fold_same_name()
+
+    def _swallow_escape(self, first):
+        """Consume the rest of an undecoded escape sequence (see _loop)."""
+        self.stdscr.nodelay(True)
+        try:
+            seq = []
+            while len(seq) < 32:
+                nx = self.stdscr.getch()
+                if nx == -1:
+                    break
+                seq.append(nx)
+                if first == 27 and len(seq) == 1 and nx != ord("["):
+                    break                      # Alt+key: ESC + one byte
+                if first == 27 and seq[:2] == [ord("["), ord("M")]:
+                    if len(seq) == 5:          # X10 mouse: 3 raw bytes follow
+                        break
+                    continue
+                if (first == curses.KEY_MOUSE or len(seq) > 1) \
+                        and 0x40 <= nx <= 0x7E and nx != ord("["):
+                    break                      # CSI final byte
+        finally:
+            self.stdscr.nodelay(False)
+            self.stdscr.timeout(350)
+
+    def _blocking_getch(self):
+        self.stdscr.timeout(-1)
+        try:
+            return self.stdscr.getch()
+        finally:
+            self.stdscr.timeout(350)
+
+    def display_title(self, chat, seen=None):
+        """What to show for a chat: your custom name > /rename title > its name
+        when you last left it > Claude's auto name > first user message. Claude uses the short id as a placeholder
+        name until it auto-names a fresh chat, so we skip id-like names."""
+        sid = chat["id"]
+        if self.names.get(sid):
+            return self.names[sid]
+
+        def _real(name):
+            if not name:
+                return None
+            if name == sid or name == sid.split("-")[0]:
+                return None
+            if re.fullmatch(r"[0-9a-f]{8}", name):  # bare hex placeholder
+                return None
+            return name
+
+        # The name it had when you last LEFT the chat beats Claude's current
+        # one: Claude re-titles a chat when it is relaunched as a bg agent while
+        # you are away (a LinkedIn chat became "toolsearch bash invocation" and
+        # looked gone). Only a deliberate /rename overrides it.
+        rec = self._agents.get(sid)
+        return (_real(chat.get("custom_title"))
+                or _real((load_seen_titles() if seen is None else seen).get(sid))
+                or _real(rec.get("name") if rec else None)
+                or _real(self.cnames.get(sid))
+                or _real(chat.get("ai_title"))
+                or chat["title"])
+
+    def _read_line(self, prompt, initial=""):
+        """Bottom-bar text input with cursor movement. Returns the string on
+        Enter, or None on Esc. Supports ←/→, Home/End, Backspace, Delete."""
+        curses.curs_set(1)
+        self.stdscr.timeout(-1)
+        buf = list(initial)
+        pos = len(buf)  # cursor index within buf
+        try:
+            while True:
+                h, w = self.stdscr.getmaxyx()
+                s = (prompt + "".join(buf))[: w - 1]
+                self.stdscr.move(h - 1, 0)
+                self.stdscr.clrtoeol()
+                self.stdscr.addstr(h - 1, 0, s, curses.A_BOLD)
+                self.stdscr.move(h - 1, min(len(prompt) + pos, w - 1))
+                self.stdscr.refresh()
+                k = self.stdscr.getch()
+                if k == 27:  # Esc alone -> cancel; or start of an arrow sequence
+                    self.stdscr.nodelay(True)
+                    seq = []
+                    while len(seq) < 3:
+                        nx = self.stdscr.getch()
+                        if nx == -1:
+                            break
+                        seq.append(nx)
+                        if seq[-1] in (ord("D"), ord("C"), ord("H"), ord("F")):
+                            break
+                    self.stdscr.nodelay(False)
+                    if not seq:
+                        return None  # real Esc -> cancel
+                    code = seq[-1]
+                    if code == ord("D"):      # left
+                        pos = max(0, pos - 1)
+                    elif code == ord("C"):    # right
+                        pos = min(len(buf), pos + 1)
+                    elif code == ord("H"):    # home
+                        pos = 0
+                    elif code == ord("F"):    # end
+                        pos = len(buf)
+                    continue
+                if k in (curses.KEY_ENTER, 10, 13):
+                    return "".join(buf).strip()
+                if k in (curses.KEY_BACKSPACE, 127, 8):
+                    if pos > 0:
+                        buf.pop(pos - 1)
+                        pos -= 1
+                elif k == curses.KEY_DC:  # Delete
+                    if pos < len(buf):
+                        buf.pop(pos)
+                elif k == curses.KEY_LEFT:
+                    pos = max(0, pos - 1)
+                elif k == curses.KEY_RIGHT:
+                    pos = min(len(buf), pos + 1)
+                elif k == curses.KEY_HOME:
+                    pos = 0
+                elif k == curses.KEY_END:
+                    pos = len(buf)
+                elif 32 <= k <= 126:
+                    buf.insert(pos, chr(k))
+                    pos += 1
+        finally:
+            curses.curs_set(0)
+            self.stdscr.timeout(350)
+
+    def _draw_indicator(self, y, status, sel):
+        """Draw the 5-col status indicator at the left of a row. 'running' is a
+        smooth pulse: three fixed dots with the lit one gliding across them."""
+        try:
+            if status == "running":
+                active = self.anim % 3
+                for i in range(3):
+                    if sel:
+                        attr = curses.color_pair(7) | (curses.A_BOLD if i == active else 0)
+                    else:
+                        attr = curses.color_pair(9) | (
+                            curses.A_BOLD if i == active else curses.A_DIM)
+                    self.stdscr.addstr(y, 1 + i, "•", attr)
+            else:
+                glyph, pair = STATUS_ICON.get(status, STATUS_ICON["unknown"])
+                attr = (curses.color_pair(7) if sel
+                        else curses.color_pair(pair)) | curses.A_BOLD
+                self.stdscr.addstr(y, 1, glyph, attr)
+        except curses.error:
+            pass
+
+    def refresh_live(self, force=False):
+        """Recompute per-chat status + the live-agent set. The agents query is
+        throttled (it spawns `claude`); job tempo files are cheap, read each time."""
+        now = time.time()
+        if force or now - self._agents_ts > 2.5:
+            self._agents = agents_active(shared=not force)
+            self._agents_ts = now
+        jobs = job_tempo_map()
+        active = self._agents
+        self.cnames = claude_names()
+        self.live = {c["id"]: resolve_status(c["id"], active, jobs)
+                     for c in self.all_chats}
+        # EVERY active background agent refuses a plain `--resume` (verified),
+        # whether busy, blocked, or idle/done. So all of them are "live" and need
+        # stop / fork / attach. Only truly-closed sessions resume directly.
+        self.live_ids = set(active.keys())
+
+    def _autolink_compacts(self, cache):
+        """When a chat runs out of context Claude continues it in a BRAND-NEW
+        session. That continuation inherits the same ai-title but nothing links it
+        to the chat it came from, so the two sit side by side as duplicates for
+        ever (this is what produced "Add NASA rovers" three times). Link them, so
+        only the newest one shows, the same dedup a normal resume already gets.
+
+        Deliberately narrow, because hiding a chat wrongly is the worst thing this
+        tool can do:
+          * ONLY true compact-continuations (`compact_child`). A fork or a plain
+            full-history copy starts with the ORIGINAL's first message, not a
+            summary, and is indistinguishable from a deliberate second copy, so
+            those are never touched.
+          * The parent must be PROVEN, not guessed: its last message must appear
+            inside the child. Unrelated same-title chats share no messages at all
+            and are correctly left alone.
+          * A child inherits its ancestors' summaries, so several ancestors can
+            match; take the most RECENT one, which is the immediate parent.
+        """
+        smap = getattr(self, "superseded_map", {})
+        tags = getattr(self, "tags", {})
+        chats = list(cache.values())
+        already = set(smap.values())          # something already points at it
+        # Attempt each child at most once per run: a child whose parent can't be
+        # proven would otherwise re-read its (multi-MB) transcript on every ~2s
+        # tick, forever. Its parent always predates it, so one attempt is enough.
+        tried = self._autolink_tried
+        children = [c for c in chats
+                    if c.get("compact_child")
+                    and c["id"] not in already and c["id"] not in tried]
+        if not children:
+            return                            # fast path: nothing to do (the norm)
+        for child in children:
+            tried.add(child["id"])
+            ckey = child.get("ai_title") or child.get("title")
+            cands = [p for p in chats
+                     if p["id"] != child["id"]
+                     and p["id"] not in smap
+                     and (p.get("ai_title") or p.get("title")) == ckey
+                     and project_key_for(p, tags) == project_key_for(child, tags)
+                     and p["mtime"] <= child["mtime"]]
+            if not cands:
+                continue
+            kid_uuids = _all_uuids(child["path"])
+            if not kid_uuids:
+                continue
+            anc = [p for p in cands
+                   if (_tail_last_uuid(p["path"]) or "\0") in kid_uuids]
+            if not anc:
+                continue
+            parent = max(anc, key=lambda p: p["mtime"])   # immediate ancestor
+            self.superseded_map = _json_set(
+                SUPERSEDED_STORE, parent["id"], child["id"])
+            smap = self.superseded_map
+
+    def _settle_paused(self):
+        """Reload the PAUSED marks and drop any whose chat you have typed into
+        since it was paused."""
+        paused = load_paused()
+        if paused:
+            by_id = {c["id"]: c for c in self.all_chats}
+            for sid, when in list(paused.items()):
+                c = by_id.get(sid)
+                if c and isinstance(when, (int, float)) and _typed_since(c["path"], when):
+                    paused = _json_set(PAUSED_STORE, sid, None)
+        return paused
+
+    def rescan(self):
+        """Re-scan ~/.claude/projects for chat files and refresh self.all_chats.
+        Incremental: a chat's title/cwd never change once written, so we only
+        parse files that are new or whose mtime moved, and reuse cached parses
+        otherwise. This is what lets one claude-c instance pick up chats created
+        by ANOTHER instance (or by `n` here) without a manual reload. Returns the
+        set of session ids that newly appeared since the last scan."""
+        cache = self._chat_cache
+        seen = set()
+        new_ids = set()
+        if PROJECTS_DIR.exists():
+            for proj in PROJECTS_DIR.iterdir():
+                if not proj.is_dir():
+                    continue
+                for f in proj.glob("*.jsonl"):
+                    p = str(f)
+                    seen.add(p)
+                    try:
+                        mtime = f.stat().st_mtime
+                    except OSError:
+                        continue
+                    cached = cache.get(p)
+                    if cached is not None:
+                        cached["mtime"] = mtime  # touch; title/cwd are stable
+                        continue
+                    c = parse_chat(f)
+                    if c:
+                        cache[p] = c
+                        new_ids.add(c["id"])
+        for host, root in remote_project_roots():
+            for proj in root.iterdir():
+                if not proj.is_dir():
+                    continue
+                for f in proj.glob("*.jsonl"):
+                    p = str(f)
+                    seen.add(p)
+                    try:
+                        mtime = f.stat().st_mtime
+                    except OSError:
+                        continue
+                    cached = cache.get(p)
+                    if cached is not None:
+                        cached["mtime"] = mtime
+                        continue
+                    c = parse_chat(f)
+                    if c:
+                        c["host"] = host
+                        cache[p] = c
+                        new_ids.add(c["id"])
+        for p in list(cache):  # drop files that were deleted on disk
+            if p not in seen:
+                del cache[p]
+        # Link any auto-compact continuation to the chat it came from, so Claude
+        # silently splitting a full chat doesn't leave a duplicate on the board.
+        self._autolink_compacts(cache)
+        # Hide chats that were resumed into a fresh background session (their
+        # continuation carries the same name/category), so the old pre-resume
+        # entry doesn't linger next to it as a duplicate.
+        #
+        # THE INVARIANT (learned the hard way, three times): a chat may be hidden
+        # ONLY when a real replacement is actually visible in the SAME project.
+        # Never hide a chat behind something the user can't see in its place.
+        # A `--bg --resume` records `old -> new` immediately, but the new bg
+        # session's .jsonl doesn't exist until the agent emits output, the agent
+        # can die / stay idle forever / mis-parse its id, and the continuation can
+        # even land in a DIFFERENT project (a worktree, another cwd). Hiding `old`
+        # in any of those cases makes it vanish from its project with nothing to
+        # replace it. So we hide `old` only when its supersede chain reaches an
+        # on-disk continuation whose project key equals old's. Everything else
+        # (dangling, still-being-born, cross-project) stays visible.
+        #
+        # A link whose continuation has no file is kept, never pruned: it hides
+        # nothing meanwhile, and a server chat's file reaches the mirror long
+        # after the link is written. Pruning lost those links for good.
+        smap = getattr(self, "superseded_map", {})
+        tags = getattr(self, "tags", {})
+        by_id = {c["id"]: c for c in cache.values()}    # only sessions with a file
+
+        def pkey(cid):
+            c = by_id.get(cid)
+            return project_key_for(c, tags) if c else None
+
+        hidden = set()
+        kept = set()   # superseded, but kept on the board because it isn't Done
+        for old in smap:
+            chain = set()
+            nxt = smap.get(old)
+            head_file = None       # first continuation in the chain that has a file
+            while nxt and nxt not in chain:
+                chain.add(nxt)
+                if nxt in by_id:
+                    head_file = nxt
+                    break
+                nxt = smap.get(nxt)
+            if head_file is not None:
+                # Only hide when old itself is on disk AND its continuation is in
+                # the same project, otherwise old would disappear from its view.
+                if old in by_id and pkey(head_file) == pkey(old):
+                    # …and ONLY when the chat is filed Done. Nothing that is still
+                    # In Progress / To Test / Later / Failed / Uncategorized may be
+                    # folded away automatically, no matter how good the replacement
+                    # looks: unfinished work must never leave the board on its own.
+                    # A non-Done predecessor stays visible, marked with '⤷'.
+                    if self.category_of(old) in AUTO_FOLD_CATEGORIES:
+                        hidden.add(old)
+                    else:
+                        kept.add(old)
+        self.superseded = hidden
+        self.kept_superseded = kept
+        # A chat that moved to a server shows once: the server copy wins over the
+        # stale laptop transcript it was moved from.
+        remote_ids = {c["id"] for c in cache.values() if c.get("host")}
+        self.all_chats = sorted(
+            (c for c in cache.values() if c["id"] not in hidden
+             and (c.get("host") or c["id"] not in remote_ids)),
+            key=lambda c: c["mtime"], reverse=True)
+        return new_ids
+
+    def _fold_same_name(self):
+        """Work out self.folded. Writes no board state: categories, stars and
+        links stay as they are, so 'a' shows every copy exactly as it was."""
+        seen, groups = load_seen_titles(), {}
+        for c in self.all_chats:
+            name = " ".join(self.display_title(c, seen).split()).casefold()
+            groups.setdefault((project_key_for(c, self.tags), name), []).append(c)
+        groups = [g for g in groups.values() if len(g) > 1]
+        keep = set(load_badges()) | set(self.paused)  # role chats and parked chats
+        # A chat being opened by id (session restore) must be on the board.
+        want = None if self._positioned else self._want_select
+        folded = {}
+        for members in groups:
+            for copies in self.lineage.components(members, self.superseded_map):
+                newest = max(copies, key=self.lineage.recency)["id"]
+                for c in copies:
+                    sid = c["id"]
+                    if sid != newest and sid not in keep and not (want and sid.startswith(want)):
+                        folded[sid] = newest
+        self.folded = folded
+        self.lineage.save()
+
+    def unique_fork_name(self, title):
+        """'name ⑂N' with the first free N: a deliberate fork is a second chat,
+        so it gets its own name and does not fold."""
+        base = re.sub(r"\s*⑂\d*$", "", title).strip()
+        seen = load_seen_titles()
+        used = set(load_names().values()) | {self.display_title(c, seen) for c in self.all_chats}
+        n = 1
+        while f"{base} ⑂{n}" in used:
+            n += 1
+        return f"{base} ⑂{n}"
+
+    def category_of(self, chat_id):
+        return self.store.get(chat_id, UNCATEGORIZED)
+
+    def project_name(self, key):
+        if not key:
+            return "all projects"
+        name = self.projects_added.get(key)
+        if name:
+            return name
+        if os.path.isabs(key):                       # a real folder -> basename
+            return os.path.basename(key.rstrip("/")) or key
+        return key                                   # virtual project: name is the key
+
+    def project_color(self, key):
+        """The project's signature color ('#RRGGBB'), assigned on first sight.
+        None for "All projects", that view stays deliberately colorless, so a
+        colored board always means you're looking at exactly one project."""
+        if not key or not projcolor:
+            return None
+        try:
+            return projcolor.color_for(key)
+        except Exception:
+            return None
+
+    def project_cwd(self, key):
+        """Default working directory for new chats started in a project. For a
+        folder-based project that's the folder itself; for a virtual project
+        it's an explicitly-stored cwd (if any)."""
+        if not key:
+            return None
+        if os.path.isdir(key):
+            return key
+        return self.project_cwds.get(key)
+
+    # --- per-project default permission mode -------------------------------
+    # Claude Code reads the starting permission mode of a new chat from
+    # <project>/.claude/settings.local.json -> permissions.defaultMode. These
+    # helpers let the projects panel show and change it per project.
+    def project_settings_path(self, key):
+        """Path to the project's .claude/settings.local.json, or None when the
+        project has no known folder on disk (a virtual project without a cwd)."""
+        d = self.project_cwd(key)
+        if not d or not os.path.isdir(d):
+            return None
+        return Path(d) / ".claude" / "settings.local.json"
+
+    def read_default_mode(self, key):
+        p = self.project_settings_path(key)
+        if not p:
+            return None
+        perms = _load_json(p).get("permissions")
+        return perms.get("defaultMode") if isinstance(perms, dict) else None
+
+    def set_default_mode(self, key, mode):
+        """Set (or, when mode is None, clear) permissions.defaultMode in the
+        project's settings.local.json, preserving every other key. Returns
+        False if the project has no folder to write into."""
+        p = self.project_settings_path(key)
+        if not p:
+            return False
+
+        def fn(d):
+            perms = d.get("permissions")
+            if not isinstance(perms, dict):
+                perms = {}
+                d["permissions"] = perms
+            if mode is None:
+                perms.pop("defaultMode", None)
+            else:
+                perms["defaultMode"] = mode
+        _json_update(p, fn)
+        return True
+
+    def choose_default_mode(self, key):
+        """Bottom-line picker to set a project's starting permission mode.
+        Enter defaults to auto, the same mode a new chat starts in."""
+        if self.project_settings_path(key) is None:
+            self.message = "No folder on disk for this project, can't set a mode"
+            return
+        cur = self.read_default_mode(key) or "unset"
+        h, w = self.stdscr.getmaxyx()
+        # Header (context) + option legend. On a narrow terminal a single
+        # clamped line would drop the legend, the part that says what each key
+        # does, so wrap the whole thing over as many bottom rows as it needs.
+        # Number and label are joined by a non-breaking space (shown as a space)
+        # so a wrap can never split "2" from "acceptEdits".
+        header = f"Set start mode for “{_bidi(self.project_name(key))}” (now: {cur})"
+        legend = "   ".join([
+            "1 default", "2 acceptEdits", "3 plan",
+            "4 bypass", "5 auto", "0 clear", "Enter=auto", "Esc=cancel",
+        ])
+        block = (_wrap(header, w - 1) + _wrap(legend, w - 1))[-(h - 1):] or [legend]
+        start = max(0, h - len(block))
+        for i, ln in enumerate(block):
+            try:
+                self.stdscr.addstr(start + i, 0, ln[: w - 1],
+                                   curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.clrtoeol()
+            except curses.error:
+                pass
+        self.stdscr.refresh()
+        k = self._blocking_getch()
+        if k in (27, ord("q")):
+            self.message = "Mode unchanged"
+            return
+        if k in (ord("0"), ord("c"), ord("C")):
+            self.set_default_mode(key, None)
+            self.message = f"Cleared default mode for “{self.project_name(key)}”"
+            return
+        modes = {ord("1"): "default", ord("2"): "acceptEdits",
+                 ord("3"): "plan", ord("4"): "bypassPermissions",
+                 ord("5"): "auto",
+                 10: "auto", 13: "auto",
+                 curses.KEY_ENTER: "auto"}
+        mode = modes.get(k)
+        if not mode:
+            self.message = "Mode unchanged"
+            return
+        self.set_default_mode(key, mode)
+        self.message = f"Default mode → {mode} for “{self.project_name(key)}”"
+
+    def project_list(self):
+        """[(None, 'All'), (key, name), ...], union of explicitly-added projects
+        and the effective project of every chat (its tag override, or else its
+        folder)."""
+        keys = set(self.projects_added)
+        for c in self.all_chats:
+            k = project_key_for(c, self.tags)
+            if k and k != "(unknown)":
+                keys.add(k)
+        ordered = sorted(keys, key=lambda k: self.project_name(k).lower())
+        return [(None, "All projects (no filter)")] + [(k, self.project_name(k))
+                                                       for k in ordered]
+
+    def panel_project_list(self):
+        """project_list() minus the hidden projects: what the P panel shows.
+        Ctrl+H (self.show_hidden) reveals them; the ACTIVE project is always
+        listed even when hidden, so the ● marker never goes missing."""
+        if self.show_hidden or not self.hidden_projects:
+            return self.project_list()
+        return [(k, nm) for k, nm in self.project_list()
+                if k not in self.hidden_projects or k == self.active_project]
+
+    def _save_projects(self):
+        def fn(d):
+            d["active"] = self.active_project or "__all__"  # None = explicit "All"
+            d["list"] = self.projects_added
+            d["cwds"] = self.project_cwds
+            d["hidden"] = sorted(self.hidden_projects)
+            d["show_hidden"] = self.show_hidden
+        _json_update(PROJECTS_STORE, fn)
+
+    def _add_project(self):
+        raw = self._read_line("Add project folder (path): ", "")
+        if not raw:
+            return
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+                self.message = f"Created {path}"
+            except Exception as e:
+                self.message = f"Couldn't create: {e}"
+                return
+        else:
+            self.message = f"Added {path}"
+        self.projects_added.setdefault(path, "")
+        self.active_project = path
+        self._save_projects()
+
+    def _draw_projects(self, items, sel):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        head = " Projects "
+        if self.hidden_projects:
+            head += (f" ({len(self.hidden_projects)} hidden"
+                     + (", shown" if self.show_hidden else "") + ") ")
+        self.stdscr.addstr(0, 0, head[: w - 1], curses.A_BOLD)
+        help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
+                 "o mode   c recolor   h hide/unhide   ^H show hidden   "
+                 "d remove   Esc/q/p back")
+        for i, ln in enumerate(_wrap(help_, w - 1)[:2]):
+            self.stdscr.addstr(1 + i, 0, ln[: w - 1],
+                               curses.color_pair(8) | curses.A_DIM)
+        top = 3
+        view_h = max(1, h - top - 1)
+        start = sel - view_h + 1 if sel >= view_h else 0
+        y = top
+        for i in range(start, min(len(items), start + view_h)):
+            path, name = items[i]
+            is_sel = (i == sel)
+            active = (path == self.active_project) if path else (not self.active_project)
+            if active:
+                mark = "● "
+            elif path in self.hidden_projects:
+                mark = "◌ "        # hidden: visible only while ^H is on
+            else:
+                mark = "  "
+            if path is None:
+                detail = "show every chat"
+            else:
+                cnt = sum(1 for c in self.all_chats
+                          if project_key_for(c, self.tags) == path
+                          and (self.show_older or c["id"] not in self.folded))
+                if os.path.isabs(path):
+                    detail = f"{path}   ({cnt})"
+                else:
+                    cw = self.project_cwds.get(path)
+                    detail = (f"{cw}   " if cw else "") + f"(tagged · {cnt})"
+                md = self.read_default_mode(path)
+                if md:
+                    detail += f"   ⚙ {md}"
+                if path in self.hidden_projects:
+                    detail += "   (hidden)"
+            # A swatch in the project's own color, so this panel doubles as the
+            # legend for what you see on the board and in the status line.
+            pcol = self.project_color(path)
+            swatch = "● " if pcol else "  "
+            line = f"{mark}{swatch}{name:<26.26}  {detail}"
+            if is_sel:
+                attr = curses.color_pair(7)
+            elif path in self.hidden_projects:
+                attr = curses.A_DIM
+            elif active:
+                attr = curses.color_pair(9) | curses.A_BOLD
+            else:
+                attr = curses.A_NORMAL
+            self.stdscr.addstr(y, 0, line[: w - 1], attr)
+            if pcol and not is_sel:   # repaint just the dot in the real color
+                try:
+                    self.stdscr.addstr(y, len(mark), "●", proj_attr(pcol))
+                except curses.error:
+                    pass
+            y += 1
+        if self.message:
+            self.stdscr.addstr(h - 1, 0, self.message[: w - 1], curses.A_BOLD)
+        self.stdscr.refresh()
+
+    def projects_panel(self):
+        """Modal projects view: switch active project, add a folder, rename,
+        remove. Active project filters the board and is the cwd for new chats."""
+        sel = 0
+        try:
+            while True:
+                self.stdscr.timeout(-1)
+                items = self.panel_project_list()
+                sel = max(0, min(sel, len(items) - 1))
+                self._draw_projects(items, sel)
+                k = self.stdscr.getch()
+                if k in (ord("q"), ord("p"), ord("P")):
+                    # 'p' toggles the panel shut again, back to the project you
+                    # had before opening it (selection here only commits on Enter).
+                    return
+                if k == 27:  # Esc alone -> back; or an arrow escape sequence
+                    self.stdscr.nodelay(True)
+                    seq = []
+                    while len(seq) < 3:
+                        nx = self.stdscr.getch()
+                        if nx == -1:
+                            break
+                        seq.append(nx)
+                        if seq[-1] in (ord("A"), ord("B")):
+                            break
+                    self.stdscr.nodelay(False)
+                    if not seq:
+                        return
+                    if seq[-1] == ord("A"):
+                        sel -= 1
+                    elif seq[-1] == ord("B"):
+                        sel += 1
+                    continue
+                if k in (curses.KEY_UP, ord("k")):
+                    sel -= 1
+                elif k in (curses.KEY_DOWN, ord("j")):
+                    sel += 1
+                elif k in (curses.KEY_ENTER, 10, 13):
+                    self.active_project = items[sel][0]
+                    self._save_projects()
+                    self.sel = 0
+                    return
+                elif k in (ord("n"), ord("N")):
+                    self._add_project()
+                elif k in (ord("o"), ord("O")):
+                    path = items[sel][0]
+                    if not path:
+                        self.message = "Pick a project first to set its mode"
+                    else:
+                        self.choose_default_mode(path)
+                elif k in (ord("c"), ord("C")):
+                    # Don't like the shade this project drew? Take the next
+                    # free one. It sticks until you press c again.
+                    path = items[sel][0]
+                    if not path:
+                        self.message = "'All projects' has no color"
+                    elif not projcolor:
+                        self.message = "Colors unavailable (projcolor.py missing)"
+                    else:
+                        try:
+                            new = projcolor.reroll(path)
+                            self.message = (f"“{self.project_name(path)}” "
+                                            f"recolored → {new}")
+                        except Exception as e:
+                            self.message = f"Couldn't recolor: {e}"
+                elif k in (ord("h"), ord("H")):
+                    # Toggle: hide the selected project (it and its chats drop
+                    # out of the board), or unhide it if it's already hidden.
+                    path = items[sel][0]
+                    if path is None:
+                        self.message = "Can't hide 'All projects'"
+                    elif path in self.hidden_projects:
+                        self.hidden_projects.discard(path)
+                        self._save_projects()
+                        self.message = f"Unhidden “{self.project_name(path)}”"
+                    else:
+                        self.hidden_projects.add(path)
+                        self._save_projects()
+                        self.message = (f"Hidden “{self.project_name(path)}” "
+                                        "(^H to show hidden)")
+                        if not self.show_hidden and path != self.active_project:
+                            sel = max(0, sel - 1)  # the row just went away
+                elif k == 8:  # Ctrl+H: show / stop showing hidden projects
+                    self.show_hidden = not self.show_hidden
+                    self._save_projects()
+                    self.message = ("Showing hidden projects"
+                                    if self.show_hidden else "Hiding hidden projects")
+                    sel = 0
+                elif k in (ord("r"), ord("R")):
+                    path = items[sel][0]
+                    if not path:
+                        self.message = "Can't rename 'All projects'"
+                    else:
+                        new = self._read_line("Rename project to: ",
+                                              self.project_name(path))
+                        if new is not None:
+                            self.projects_added[path] = new  # '' -> basename
+                            self._save_projects()
+                            self.message = "Project renamed"
+                elif k in (ord("d"), ord("D")):
+                    path = items[sel][0]
+                    if path is None:
+                        self.message = "Can't remove 'All projects'"
+                    else:
+                        tagged = [sid for sid, kk in self.tags.items() if kk == path]
+                        if tagged:  # un-tag its chats -> they fall back to folders
+                            self.tags = _json_update(
+                                PROJECT_TAGS_STORE,
+                                lambda d: [d.pop(sid, None) for sid in tagged])
+                        removed = False
+                        if path in self.projects_added:
+                            del self.projects_added[path]
+                            self.project_cwds.pop(path, None)
+                            self.hidden_projects.discard(path)
+                            self._save_projects()
+                            removed = True
+                        if self.active_project == path:
+                            self.active_project = None
+                        if removed or tagged:
+                            self.message = "Project removed (chats back to folders)"
+                        else:
+                            self.message = "Has chats (auto-listed by folder), can't remove"
+        finally:
+            self.stdscr.timeout(350)
+
+    def move_chat(self, chat):
+        """Assign a chat to a project, independent of its folder. Typing an
+        existing project name files it there; a new name creates that project;
+        a blank entry clears the tag so the chat goes back to its folder's
+        project. Category (status) is untouched, it's stored separately."""
+        new = self._read_line(
+            "Move to project (name; blank = back to its folder): ", "")
+        if new is None:
+            return
+        if new == "":
+            self.tags = _json_set(PROJECT_TAGS_STORE, chat["id"], None)
+            self.message = "Project tag cleared, back to its folder"
+            return
+        key = None
+        for k, nm in self.project_list()[1:]:  # match an existing project by name
+            if nm.lower() == new.lower():
+                key = k
+                break
+        if key is None:                        # brand-new virtual project
+            key = new
+            self.projects_added.setdefault(key, new)
+            self._save_projects()
+        self.tags = _json_set(PROJECT_TAGS_STORE, chat["id"], key)
+        self.message = f"Moved to project “{self.project_name(key)}”"
+
+    def visible_chats(self):
+        cs = self.all_chats
+        if self.active_project:
+            cs = [c for c in cs
+                  if project_key_for(c, self.tags) == self.active_project]
+        elif self.hidden_projects and not self.show_hidden:
+            # "All projects" means all the projects you still care about:
+            # chats from hidden ones stay out until Ctrl+H (P panel) shows them.
+            cs = [c for c in cs
+                  if project_key_for(c, self.tags) not in self.hidden_projects]
+        if self.marked_only:
+            # Ctrl+S. Deliberately BOTH marks: the whole point of the special ♡
+            # is that it lives in the same shortlist as the stars, just without
+            # shouting on the full board.
+            cs = [c for c in cs
+                  if c["id"] in self.starred or c["id"] in self.special]
+        if self.folded and not self.show_older:
+            # An older copy hides only while the copy replacing it is in this view.
+            here = {c["id"] for c in cs}
+            cs = [c for c in cs if self.folded.get(c["id"]) not in here]
+        return cs
+
+    def grouped(self):
+        groups = {cat: [] for cat in DISPLAY_ORDER}
+        for c in self.visible_chats():
+            groups[self.category_of(c["id"])].append(c)
+        # Order each category by recency = the MORE recent of the chat's own last
+        # activity (file mtime) and when you last filed it here. So a chat you just
+        # moved jumps to the top of its new category (an accidental move stays in
+        # plain sight), while a chat you filed long ago but kept working in still
+        # rises on real activity. Untouched-by-the-board chats fall back to mtime.
+        for members in groups.values():
+            members.sort(
+                key=lambda c: max(c["mtime"], self.moved.get(c["id"], 0)),
+                reverse=True)
+        return groups
+
+    def build_rows(self):
+        """Flat list of display rows. Each row is (kind, payload). The second
+        return value `nav` lists the indices of selectable rows, both headers
+        (so you can collapse/expand) and chats. Collapsed categories hide their
+        chats but keep the header."""
+        rows = []
+        nav = []  # indices into rows that the cursor can land on
+        groups = self.grouped()
+        for cat in DISPLAY_ORDER:
+            members = groups[cat]
+            if cat == UNCATEGORIZED and not members:
+                continue  # hide empty landing bucket
+            nav.append(len(rows))
+            rows.append(("header", cat))
+            if cat in self.collapsed:
+                continue  # collapsed -> hide members
+            if not members:
+                rows.append(("empty", cat))
+            for c in members:
+                nav.append(len(rows))
+                rows.append(("chat", c))
+        return rows, nav
+
+    def run(self):
+        reset_tty_modes()  # again, now curses is up: nothing may re-arm the mouse
+        curses.curs_set(0)
+        setup_colors()
+        self.stdscr.timeout(350)  # wake often so the running-dot animates smoothly
+        curses.flushinp()  # drop any keys buffered before the board opened
+        # Ctrl+S (marked-only) is XOFF to the terminal driver by default, so it
+        # has to be turned off here or the key never arrives. Restored on the way
+        # out so chats and the shell you quit to keep normal flow control.
+        _flow = _no_flow_control()
+        try:
+            self._loop()
+        finally:
+            _restore_flow_control(_flow)
+
+    def _loop(self):
+        while True:
+            rows, nav = self.build_rows()
+            if not self._positioned and self._want_select:
+                # Prefix match, so a SHORT agent id (what `claude attach` and the
+                # session-restore snapshot use) finds the full session uuid too.
+                found = False
+                for i, ri in enumerate(nav):
+                    cid = rows[ri][1]["id"] if rows[ri][0] == "chat" else None
+                    if cid and (cid == self._want_select
+                                or cid.startswith(self._want_select)):
+                        self.sel = i
+                        found = True
+                        break
+                self._select_tries += 1
+                # Keep looking for a few passes: the live-agent scan is still
+                # settling on the first draw, so a chat can be missing from the
+                # rows for a moment and then appear. Giving up on pass 1 is what
+                # made session restore land on the board instead of the chat.
+                give_up = self._select_tries >= 20
+                if found or give_up:
+                    self._positioned = True
+                # Only auto-open when the chat was actually located. Without
+                # this, a stale id would leave the cursor on row 0 and Enter
+                # would open somebody else's conversation.
+                if self._auto_open and found:
+                    self._auto_open = False
+                    # Same code path as a real Enter keypress on the selection.
+                    if not self.handle_key(curses.KEY_ENTER, nav):
+                        return
+                elif self._auto_open and give_up:
+                    self._auto_open = False
+            if self._reselect_id is not None:
+                for i, ri in enumerate(nav):
+                    if rows[ri][0] == "chat" and rows[ri][1]["id"] == self._reselect_id:
+                        self.sel = i
+                        break
+                self._reselect_id = None
+            if self.sel >= len(nav):
+                self.sel = max(0, len(nav) - 1)
+            self.draw(rows, nav)
+            ch = self.stdscr.getch()
+            if ch in (27, curses.KEY_MOUSE):
+                # The board binds no Esc and no mouse. A raw ESC here is the
+                # head of a sequence curses didn't decode, most often a mouse
+                # click from a terminal a killed chat left in mouse mode
+                # (ESC [ M b x y, or ESC [ < b;x;y M). Read as keys, its bytes
+                # hit real bindings: a click near column 78 is 'n' (new chat),
+                # digits move the selected chat. Swallow the whole thing.
+                self._swallow_escape(ch)
+                reset_tty_modes(show_cursor=False)
+                continue
+            if ch == -1 and _code_changed():
+                # chats.py was edited (a new feature landed): reload on an idle
+                # tick, exactly like Ctrl+R, so old boards never run stale code.
+                self.reload = True
+                return
+            if ch == curses.KEY_RESIZE:
+                self._on_resize()
+                continue
+            if not self.handle_key(ch, nav):
+                return
+
+    def _on_resize(self):
+        """Terminator/VTE fires a burst of KEY_RESIZE events while the window is
+        being dragged, and leaves stale/garbled cells behind when it reflows. ncurses
+        already resized stdscr by the time we see the event, so the layout tracks the
+        drag on its own, but a plain erase()+diff won't rewrite the cells VTE
+        corrupted. So we just arm a short debounce here; once the events stop (~120ms,
+        i.e. the drag is done) the timeout tick does ONE hard clear()+full repaint that
+        wipes the garbage. Polling fast meanwhile makes us notice the gap promptly."""
+        curses.update_lines_cols()  # keep curses.LINES/COLS in sync (draw() uses getmaxyx)
+        self._resize_settle = time.time() + 0.12
+        self.stdscr.timeout(50)
+
+    def _selected_row(self, nav):
+        if not nav:
+            return (None, None)
+        rows, _ = self.build_rows()
+        return rows[nav[self.sel]]
+
+    def selected_chat(self, nav):
+        kind, payload = self._selected_row(nav)
+        return payload if kind == "chat" else None
+
+    def selected_header(self, nav):
+        kind, payload = self._selected_row(nav)
+        return payload if kind == "header" else None
+
+    def toggle_collapse(self, cat):
+        if cat in self.collapsed:
+            self.collapsed.discard(cat)
+        else:
+            self.collapsed.add(cat)
+        _json_update(COLLAPSE_STORE,
+                     lambda d: d.__setitem__("collapsed", sorted(self.collapsed)))
+
+    def _record_move(self, chat_id, prev_cat):
+        """Stamp a category move's time (drives the recency sort) and remember the
+        prior state so `u` can revert the last move."""
+        self._last_move = (chat_id, prev_cat, self.moved.get(chat_id))
+        self.moved = _json_set(MOVED_STORE, chat_id, time.time())
+
+    def _undo_move(self):
+        """Revert the most recent category move, both the category and the
+        recency stamp, so a stray 1-6 keypress is a one-key fix."""
+        if not self._last_move:
+            self.message = "Nothing to undo"
+            return
+        cid, prev_cat, prev_ts = self._last_move
+        self._last_move = None
+        # prev_cat == Uncategorized means it had no tag -> delete the key.
+        self.store = _json_set(
+            STORE, cid, None if prev_cat == UNCATEGORIZED else prev_cat)
+        # prev_ts None -> it had never been filed before; delete the stamp.
+        self.moved = _json_set(MOVED_STORE, cid, prev_ts)
+        self._reselect_id = cid  # snap the cursor back to it
+        self.message = f"Undone, back to “{prev_cat}”"
+
+    def _search_jump(self, nav):
+        """Find a chat by name anywhere on the board and jump the cursor to it, so
+        even one buried deep in a big category is reachable. Pressing / again with
+        the same query cycles to the next match (wrapping at the end)."""
+        q = self._read_line("Find (name): ", self._search)
+        if q is None:
+            return
+        q = q.strip().lower()
+        self._search = q
+        if not q:
+            return
+        groups = self.grouped()
+        ordered = [c for cat in DISPLAY_ORDER for c in groups[cat]]  # board order
+        matches = [c for c in ordered if q in self.display_title(c).lower()]
+        if not matches:
+            self.message = f"No match for “{q}”"
+            return
+        cur = self.selected_chat(nav)
+        target = None
+        if cur is not None:  # first match strictly after the cursor (cycle)
+            ids = [c["id"] for c in ordered]
+            try:
+                start = ids.index(cur["id"]) + 1
+            except ValueError:
+                start = 0
+            target = next((c for c in ordered[start:]
+                           if q in self.display_title(c).lower()), None)
+        if target is None:
+            target = matches[0]
+        cat = self.category_of(target["id"])
+        if cat in self.collapsed:  # expand so the cursor can land on it
+            self.toggle_collapse(cat)
+        self._reselect_id = target["id"]
+        n = len(matches)
+        self.message = (f"Found: {self.display_title(target)}"
+                        + (f"  ({n} matches, / for next)" if n > 1 else ""))
+
+    def handle_key(self, ch, nav):
+        if ch == -1:  # timeout tick, advance animation; refresh data ~1/sec
+            if self._resize_settle and time.time() >= self._resize_settle:
+                # The resize drag has stopped, force a full repaint to wipe the
+                # garbage VTE left, then go back to the normal animation cadence.
+                self._resize_settle = 0.0
+                self.stdscr.timeout(350)
+                self.stdscr.clear()  # clearok -> next draw()'s refresh fully repaints
+            self.anim += 1
+            now = time.time()
+            if now - self._scan_ts > 2.0:
+                # Pick up chats / category / name edits made by another claude-c
+                # instance (or by `n` here) without a manual reload.
+                self._scan_ts = now
+                sel_chat = self.selected_chat(nav)
+                self.store = load_store()
+                self.names = load_names()
+                self.starred = load_starred()
+                self.special = load_special()
+                self.paused = self._settle_paused()
+                self.moved = load_moved()
+                self.tags = load_project_tags()
+                self.superseded_map = load_superseded()  # rescan() resolves & sets self.superseded
+                new_ids = self.rescan()
+                if sel_chat:  # keep the cursor on the same chat as rows shift
+                    self._reselect_id = sel_chat["id"]
+                if new_ids:
+                    self.refresh_live(force=True)
+                    self._live_ts = now
+                self._fold_same_name()
+            if now - self._live_ts > 1.0:
+                self.refresh_live()
+                self._live_ts = now
+            return True
+        self.message = ""
+        if ch in (ord("q"),):
+            return False
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            if nav:
+                self.sel = min(self.sel + 1, len(nav) - 1)
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.sel = max(self.sel - 1, 0)
+        elif ch in (ord(" "),):  # Space, collapse/expand the section header
+            cat = self.selected_header(nav)
+            if cat:
+                self.toggle_collapse(cat)
+        elif ch in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
+            c = self.selected_chat(nav)
+            if c:
+                cat = CATEGORIES[ch - ord("1")]
+                cur = self.category_of(c["id"])
+                # Going In Progress -> Done straight skips “Done, Not
+                # Committed”, i.e. the work probably isn't committed yet. Ask.
+                if (cat == "Done" and cur == "In Progress"
+                        and not self.confirm_skip_commit(c)):
+                    self.message = "Kept in “In Progress”, commit it first"
+                elif cat == cur:
+                    self.message = f"Already in “{cat}”"
+                else:
+                    self._record_move(c["id"], cur)
+                    self.store = _json_set(STORE, c["id"], cat)
+                    self.message = f"Moved to “{cat}”  ·  u to undo"
+        elif ch in (ord("s"), ord("S")):
+            # One key, three states: unmarked -> ★ starred -> ♡ special ->
+            # unmarked. "Double s" is the special mark, so the loud star and the
+            # quiet keepsake never need two different keys to reach.
+            c = self.selected_chat(nav)
+            if c:
+                if c["id"] in self.starred:          # ★ -> ♡
+                    self.starred = _json_set(STARRED_STORE, c["id"], None)
+                    self.special = _json_set(SPECIAL_STORE, c["id"], True)
+                    self.message = "Special ♡  ·  s again to clear"
+                elif c["id"] in self.special:        # ♡ -> unmarked
+                    self.special = _json_set(SPECIAL_STORE, c["id"], None)
+                    self.message = "Mark cleared"
+                else:                                # unmarked -> ★
+                    self.starred = _json_set(STARRED_STORE, c["id"], True)
+                    self.message = "Starred ★  ·  s again for special ♡"
+        elif ch == 19:  # Ctrl+S, show only the chats you've marked (★ and ♡)
+            self.marked_only = not self.marked_only
+            if self.marked_only:
+                n = len(self.visible_chats())
+                self.message = (f"Marked only: {n} chat{'' if n == 1 else 's'} "
+                                "(★ + ♡)  ·  ^S for all"
+                                if n else
+                                "Nothing marked here yet, press s on a chat "
+                                "(^S for all)")
+            else:
+                self.message = "Showing all chats"
+            self.sel = min(self.sel, max(0, len(nav) - 1))
+            self.scroll = 0
+        elif ch in (ord("u"), ord("U")):
+            self._undo_move()
+        elif ch in (ord("a"),):
+            c = self.selected_chat(nav)
+            self.show_older = not self.show_older
+            if c:
+                self._reselect_id = c["id"] if self.show_older else self.folded.get(c["id"], c["id"])
+            self.message = ("Showing older copies  ·  a to fold them"
+                            if self.show_older else "Older copies folded")
+        elif ch in (ord("/"),):
+            self._search_jump(nav)
+        elif ch in (ord("p"), ord("P")):
+            self.projects_panel()
+            self.message = (f"Project: {self.project_name(self.active_project)}"
+                            if self.active_project else "Showing all projects")
+            self.sel = 0
+        elif ch == 18:  # Ctrl+R, reload the script (re-exec; picks up code edits)
+            self.reload = True
+            return False
+        elif ch in (ord("r"),):
+            c = self.selected_chat(nav)
+            if c:
+                new = self._read_line("Rename to: ", self.display_title(c))
+                if new is not None:
+                    ids = [c["id"]]
+                    if not self.show_older:  # its folded copies are the same chat
+                        ids += [o for o, n in self.folded.items() if n == c["id"]]
+                    for sid in ids:
+                        self.names = _json_set(NAMES_STORE, sid, new or None)
+                    self.message = "Renamed" if new else "Name reset to default"
+        elif ch in (ord("m"), ord("M")):
+            c = self.selected_chat(nav)
+            if c:
+                self.move_chat(c)
+        elif ch in (ord("o"), ord("O")):
+            # Set the start permission mode for the project you're viewing -
+            # same picker as 'm' in the P panel, but without opening it. When
+            # showing "All projects", fall back to the selected chat's project.
+            key = self.active_project
+            if key is None:
+                c = self.selected_chat(nav)
+                key = project_key_for(c, self.tags) if c else None
+            if not key or key == "(unknown)":
+                self.message = ("No project here to set a mode for, "
+                                "open one (P) or select a chat")
+            else:
+                self.choose_default_mode(key)
+        elif ch in (ord("d"),):
+            c = self.selected_chat(nav)
+            if c:
+                self.confirm_delete(c)
+        elif ch in (ord("n"), ord("N")):
+            self.new_chat = True  # start a fresh chat (handled after curses ends)
+            return False
+        elif ch in (ord("f"), ord("F")):
+            c = self.selected_chat(nav)
+            if c:
+                self.resume_target, self.resume_action = c, "fork"
+                return False
+        elif ch == ord("B"):
+            # Reopen the selected chat with EVERY permission check off
+            # (`--dangerously-skip-permissions`). His explicit choice, so it
+            # always asks first; a live agent is stopped and reopened.
+            c = self.selected_chat(nav)
+            if c and self.confirm_bypass(c):
+                self.resume_target, self.resume_action = c, "bypass"
+                return False
+        elif ch in (ord("x"), ord("X")):
+            c = self.selected_chat(nav)
+            if c and c["id"] in self.live_ids:
+                self.confirm_stop(c)
+                if self.resume_target:
+                    return False
+            elif c:
+                self.message = "Not a live agent, nothing to stop"
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            c = self.selected_chat(nav)
+            if c:
+                # Live agent -> attach (non-destructive; detach with Ctrl+Z keeps
+                # it running). Closed chat -> normal resume. A chat owned by a
+                # headless `--resume -p` run can be neither: see headless_holder.
+                self.resume_target = c
+                if c["id"] in self.live_ids and headless_holder(c["id"], self._agents):
+                    self.resume_action = "headless"
+                else:
+                    self.resume_action = "attach" if c["id"] in self.live_ids else "resume"
+                return False
+            cat = self.selected_header(nav)
+            if cat:  # Enter on a section header -> collapse/expand it
+                self.toggle_collapse(cat)
+        return True
+
+    def confirm_skip_commit(self, chat):
+        """Warn when filing an In-Progress chat straight to Done, that skips
+        the “Done, Not Committed” step, which usually means the work hasn't
+        been committed yet. Returns True if the user wants to mark it Done anyway."""
+        h, w = self.stdscr.getmaxyx()
+        prompt = ("Mark Done without committing first? Skips “Done, Not "
+                  f"Committed”.  (y/N)  {_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1),
+                           curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        return self._blocking_getch() in (ord("y"), ord("Y"))
+
+    def confirm_bypass(self, chat):
+        h, w = self.stdscr.getmaxyx()
+        live = " It is live: it gets stopped and reopened." if chat["id"] in self.live_ids else ""
+        prompt = (f"Reopen with ALL permission checks OFF?{live}  (y/N)  "
+                  f"{_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        if self._blocking_getch() in (ord("y"), ord("Y")):
+            return True
+        self.message = "Bypass cancelled"
+        return False
+
+    def confirm_stop(self, chat):
+        h, w = self.stdscr.getmaxyx()
+        prompt = (f"Stop this live agent? It stops running (conversation kept).  "
+                  f"(y/N)  {_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        if self._blocking_getch() in (ord("y"), ord("Y")):
+            self.resume_target, self.resume_action = chat, "stop"
+        else:
+            self.message = "Stop cancelled"
+
+    def confirm_delete(self, chat):
+        if chat.get("host"):
+            self.message = (f"That chat lives on {chat['host']}: delete it there "
+                            f"(this is only a mirror copy)")
+            return
+        h, w = self.stdscr.getmaxyx()
+        live = "  (NOTE: this chat is running live)" if chat["id"] in self.live_ids else ""
+        prompt = f"Delete this chat permanently? (y/N)  {_bidi(chat['title'][:40])}{live}"
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4))
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        if self._blocking_getch() in (ord("y"), ord("Y")):
+            try:
+                chat["path"].unlink()
+                self.store = _json_set(STORE, chat["id"], None)
+                self.starred = _json_set(STARRED_STORE, chat["id"], None)
+                self.special = _json_set(SPECIAL_STORE, chat["id"], None)
+                self.rescan()
+                self.message = "Chat deleted"
+            except Exception as e:
+                self.message = f"Delete failed: {e}"
+        else:
+            self.message = "Delete cancelled"
+
+    def draw(self, rows, nav):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        title = " Claude Chats "
+        if self.active_project:
+            scope = self.project_name(self.active_project)
+            if self.active_project in self.hidden_projects:
+                scope += " (hidden)"
+        else:
+            scope = "all projects"
+            if self.hidden_projects:
+                n = len(self.hidden_projects)
+                scope += (f" (incl. {n} hidden)" if self.show_hidden
+                          else f" ({n} hidden)")
+        if self.marked_only:
+            # Say it in the header chip too, so a half-empty board is never a
+            # mystery: the filter stays visible the whole time it's on.
+            scope += " · ★♡ only"
+        # Header: plain "Claude Chats, N chats  " then the active project drawn
+        # as a chip filled with THAT project's own color, so a glance at the top
+        # of the screen tells you which project you're in even before you read it.
+        # "All projects" keeps the old black-on-white bar (no single color to use).
+        prefix = f"{title}- {len(self.visible_chats())} chats   "
+        self.stdscr.addstr(0, 0, prefix[: w - 1], curses.A_BOLD)
+        pcolor = self.project_color(self.active_project)
+        x = _dwidth(prefix)
+        if x < w - 1:
+            chip = _clamp(f" ▶ {_bidi(scope)} ", w - 1 - x)
+            if pcolor:
+                chip_attr = proj_attr(pcolor, chip=True, extra=curses.A_BOLD)
+            else:
+                chip_attr = curses.color_pair(7) | curses.A_BOLD  # black-on-white
+            try:
+                self.stdscr.addstr(0, x, chip, chip_attr)
+            except curses.error:
+                pass
+        help1 = ("Enter open   / find   Space fold   a older copies   n new   r rename   m move   "
+                 "o mode   f fork   B bypass   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
+                 "d delete   P projects   ^R reload   q quit")
+        self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
+        legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
+        self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
+        status_legend = "status:  ● running   ◆ needs input   ✓ done   ✗ failed"
+        self.stdscr.addstr(3, 0, status_legend[: w - 1], curses.A_DIM)
+        # Row 4 (blank until now) becomes a thin rule in the project's color.
+        # Together with the matching rule above the footer it frames the list in
+        # that color, the ambient "which project is this" cue.
+        try:
+            self.stdscr.addstr(4, 0, "─" * (w - 1),
+                               proj_attr(pcolor) if pcolor else curses.A_DIM)
+        except curses.error:
+            pass
+
+        top = 5
+        # Footer block: the FULL title of the chat under the cursor, wrapped over
+        # as many lines as it needs (capped) so even a name longer than the
+        # terminal width is fully readable. The list view shrinks to make room,
+        # so the footer never overlaps a chat row.
+        #
+        # A status message does NOT replace the title any more: it gets its own
+        # line ABOVE it. Filing a run of chats with 1-6 sets a message on every
+        # keypress, and when that message ate the footer the title of the chat
+        # you'd just landed on was invisible for the whole batch, you were
+        # filing blind. Message and title now coexist; each footer line carries
+        # its own attribute.
+        FOOTER_MAX = 5
+        footer = []
+        if self.message:
+            footer.append((_clamp(self.message, w - 2), curses.A_BOLD))
+        if nav:
+            kind, payload = rows[nav[self.sel]]
+            if kind == "chat":
+                segs = _wrap(self.display_title(payload), w - 2) or [""]
+                title_attr = curses.color_pair(8) | curses.A_BOLD
+                footer += [(_bidi(s), title_attr) for s in segs[:FOOTER_MAX]]
+                # …and under the name, how that chat signed off: DONE DONE, MUST REPLY,
+                # DONE BUT MUST READ. It is the one line that says whether the chat can be
+                # closed unread, so it belongs where the eye already is.
+                #
+                # NOT while it is running: a live agent's last tag describes a turn that has
+                # since been superseded, and showing a stale DONE DONE over a chat that is
+                # mid-work is exactly the wrong thing to tell someone who closes on the tag.
+                if self.live.get(payload["id"]) != "running":
+                    tag = last_status_tag(payload["id"])
+                    if tag:
+                        footer.append((_clamp(tag, w - 2), curses.A_BOLD))
+        footer_h = max(1, len(footer))
+        # +1 for a faint separator rule between the list and the footer.
+        view_h = h - top - footer_h - 1
+        sel_row = nav[self.sel] if nav else 0
+        if sel_row < self.scroll:
+            self.scroll = sel_row
+        elif sel_row >= self.scroll + view_h:
+            self.scroll = sel_row - view_h + 1
+
+        y = top
+        for idx in range(self.scroll, min(len(rows), self.scroll + view_h)):
+            kind, payload = rows[idx]
+            line_y = y
+            y += 1
+            if kind == "header":
+                cnt = sum(1 for c in self.visible_chats()
+                          if self.category_of(c["id"]) == payload)
+                arrow = "▸" if payload in self.collapsed else "▾"
+                is_sel = nav and idx == nav[self.sel]
+                text = f"{arrow} {payload}  ({cnt})"
+                if is_sel:
+                    text = text.ljust(w - 1)
+                    attr = curses.color_pair(7) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(CAT_COLOR[payload]) | curses.A_BOLD
+                self.stdscr.addstr(line_y, 0, text[: w - 1], attr)
+            elif kind == "empty":
+                self.stdscr.addstr(line_y, 2, "(empty)"[: w - 3],
+                                   curses.A_DIM)
+            elif kind == "chat":
+                c = payload
+                is_sel = nav and idx == nav[self.sel]
+                # The [tag] reflects the chat's EFFECTIVE project (its per-chat
+                # override if any, else its folder), not the raw cwd basename -
+                # so a chat moved into HW shows [HW], not its old folder.
+                pkey = project_key_for(c, self.tags)
+                proj = self.project_name(pkey)
+                status = self.live.get(c["id"], "unknown")
+                gcolor = STATUS_ICON.get(status, STATUS_ICON["unknown"])[1]
+                prefix = "     "  # 5 cols reserved for the status indicator
+                tail = f"  [{proj}]"
+                avail = w - 1 - _dwidth(tail) - len(prefix)
+                t = self.display_title(c)
+                if c.get("host"):  # runs on another machine (opens over ssh)
+                    t = "[srv] " + t
+                older = [o for o, n in self.folded.items() if n == c["id"]]
+                if older and not self.show_older:
+                    busy = sum(self.live.get(o) == "running" for o in older)
+                    t += f"  (+{len(older)} older" + (f", {busy} running)" if busy else ")")
+                badge = load_badges().get(c["id"])
+                if badge:  # a role chat (a Cotube channel Claude, the manager): its badge leads the row
+                    t = badge + "  " + t
+                starred = c["id"] in self.starred
+                # A chat is one or the other, never both (the 's' cycle moves it
+                # from ★ to ♡), but guard anyway so a hand-edited store can't
+                # draw two marks on one row.
+                special = (not starred) and c["id"] in self.special
+                paused = c["id"] in getattr(self, "paused", {})
+                if paused:
+                    # Wins over ★ and ♡: the whole row becomes a red bar.
+                    starred = special = False
+                    t = "⏸ PAUSED  " + t
+                elif starred:
+                    t = "★ " + t
+                elif special:
+                    t = "♡ " + t
+                if c["id"] in getattr(self, "kept_superseded", ()):
+                    # Superseded by a newer continuation, but not Done, so it was
+                    # kept instead of folded away. The arrow says "the newer copy
+                    # of this is on the board too" without hiding anything.
+                    t = "⤷ " + t
+                if _dwidth(t) > avail:
+                    t = _clamp(t, max(0, avail - 1)) + "…"
+                # _bidi() keeps a Hebrew/RTL name from flipping the whole row;
+                # pad/clamp by display width since it (and the name) may differ
+                # from code-point count.
+                pad = " " * max(0, avail - _dwidth(t))
+                body = _bidi(t) + pad + tail
+                if is_sel:
+                    # The cursor bar stays the usual white so selection always
+                    # looks the same; the ★ prefix still marks a starred chat.
+                    self.stdscr.addstr(line_y, 0, _clamp(prefix + body, w - 1),
+                                       curses.color_pair(7))
+                    self._draw_indicator(line_y, status, sel=True)
+                else:
+                    attr = ((curses.color_pair(11) | curses.A_BOLD) if paused
+                            else (curses.color_pair(10) | curses.A_BOLD)
+                            if starred else curses.A_NORMAL)
+                    # The [project] tag is written in that project's own color -
+                    # the whole point in the "all projects" view, where rows from
+                    # different projects sit side by side. A starred row keeps its
+                    # solid yellow bar (a colored tag would punch a hole in it).
+                    tag_color = None if (starred or paused) else self.project_color(pkey)
+                    if tag_color:
+                        head = _clamp(_bidi(t) + pad, w - 1 - len(prefix))
+                        self.stdscr.addstr(line_y, len(prefix), head, attr)
+                        tx = len(prefix) + _dwidth(head)
+                        if tx < w - 1:
+                            self.stdscr.addstr(line_y, tx,
+                                               _clamp(tail, w - 1 - tx),
+                                               proj_attr(tag_color))
+                    else:
+                        self.stdscr.addstr(line_y, len(prefix),
+                                           _clamp(body, w - 1 - len(prefix)),
+                                           attr)
+                    if special and t.startswith("♡") and not _has_rtl(t):
+                        # Repaint just the heart in magenta. The rest of the row
+                        # keeps its ordinary colors on purpose: this mark should
+                        # be findable, not attention-grabbing like a star. An RTL
+                        # title is skipped because _bidi() flips the mark to the
+                        # right-hand end, so column 5 isn't where it landed.
+                        try:
+                            self.stdscr.addstr(line_y, len(prefix), "♡",
+                                               curses.color_pair(5))
+                        except curses.error:
+                            pass
+                    self._draw_indicator(line_y, status, sel=False)
+
+        sep_y = h - footer_h - 1
+        try:
+            self.stdscr.addstr(sep_y, 0, "─" * (w - 1),
+                               proj_attr(pcolor) if pcolor else curses.A_DIM)
+        except curses.error:
+            pass
+        base = h - len(footer)
+        for i, (fline, fattr) in enumerate(footer):
+            try:
+                self.stdscr.addstr(base + i, 0, fline, fattr)
+            except curses.error:
+                pass
+        self.stdscr.refresh()
+
+
+EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+
+
+def load_effort_default():
+    """The persisted default thinking level for new chats. Falls back to
+    'xhigh' when unset or if the stored value is no longer a known level."""
+    d = _load_json(SETTINGS_STORE).get("effort_default")
+    return d if d in EFFORT_LEVELS else "xhigh"
+
+
+def save_effort_default(level):
+    """Persist `level` as the new default thinking level (shared, locked)."""
+    _json_set(SETTINGS_STORE, "effort_default", level)
+
+
+def prompt_effort(default=None):
+    """Ask which thinking (reasoning effort) level the new chat should use.
+    Returns one of EFFORT_LEVELS. Pressing Enter (or typing anything invalid)
+    picks the current default (persisted; initially 'xhigh'). Type 'd<n>'
+    (e.g. d4) or 'd<name>' to make that level the new persisted default and use
+    it for this chat too. Runs after curses has ended, so plain print/input is
+    fine here."""
+    if default is None:
+        default = load_effort_default()
+    while True:
+        print("\n  Thinking level for this chat:")
+        for i, lv in enumerate(EFFORT_LEVELS, 1):
+            mark = "   ← default" if lv == default else ""
+            print(f"    {i}) {lv}{mark}")
+        prompt = (f"  Choose 1-{len(EFFORT_LEVELS)} [Enter = {default}]"
+                  f", or d<n> to set the default: ")
+        try:
+            raw = input(prompt).strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        # 'd<n>' / 'd <n>' / 'd<name>', persist a new default and use it now.
+        if raw.startswith("d"):
+            arg = raw[1:].strip()
+            new = None
+            if arg.isdigit() and 1 <= int(arg) <= len(EFFORT_LEVELS):
+                new = EFFORT_LEVELS[int(arg) - 1]
+            elif arg in EFFORT_LEVELS:
+                new = arg
+            if new:
+                save_effort_default(new)
+                print(f"  ✓ default is now '{new}'.")
+                return new
+            print(f"  ? use d1-d{len(EFFORT_LEVELS)} or a level name (e.g. d4).")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(EFFORT_LEVELS):
+            return EFFORT_LEVELS[int(raw) - 1]
+        if raw in EFFORT_LEVELS:
+            return raw
+        return default
+
+
+# Model picker for new chats, shown right after the thinking-level one. Labels
+# are what you see; values go to `claude --model`. Full ids, not aliases, so a
+# new release never silently changes what "opus" means here.
+MODELS = [
+    ("opus",   "claude-opus-5-5",           "everyday default"),
+    ("sonnet", "claude-sonnet-5",           "cheaper, quick jobs"),
+    ("haiku",  "claude-haiku-4-5-20251001", "cheapest, trivial jobs"),
+    ("fable",  "claude-fable-5-1",          "most capable, burns tokens: hard problems only"),
+]
+_MODEL_NAMES = [m[0] for m in MODELS]
+
+
+def load_model_default():
+    """The persisted default model for new chats ('opus' when unset)."""
+    d = _load_json(SETTINGS_STORE).get("model_default")
+    return d if d in _MODEL_NAMES else "opus"
+
+
+def save_model_default(name):
+    _json_set(SETTINGS_STORE, "model_default", name)
+
+
+def model_id(name):
+    return next((m[1] for m in MODELS if m[0] == name), None)
+
+
+def prompt_model(default=None):
+    """Ask which model the new chat should run on. Same rules as
+    prompt_effort: Enter = the persisted default (initially 'opus'), a number
+    or name picks one, 'd<n>' also makes it the new default. Returns a label."""
+    if default is None:
+        default = load_model_default()
+    n = len(MODELS)
+    while True:
+        print("\n  Model for this chat:")
+        for i, (name, _mid, note) in enumerate(MODELS, 1):
+            mark = "   ← default" if name == default else ""
+            print(f"    {i}) {name:<7} {note}{mark}")
+        try:
+            raw = input(f"  Choose 1-{n} [Enter = {default}]"
+                        f", or d<n> to set the default: ").strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        if raw.startswith("d"):
+            arg = raw[1:].strip()
+            new = (_MODEL_NAMES[int(arg) - 1] if arg.isdigit() and 1 <= int(arg) <= n
+                   else arg if arg in _MODEL_NAMES else None)
+            if new:
+                save_model_default(new)
+                print(f"  ✓ default is now '{new}'.")
+                return new
+            print(f"  ? use d1-d{n} or a model name (e.g. d1).")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= n:
+            return _MODEL_NAMES[int(raw) - 1]
+        if raw in _MODEL_NAMES:
+            return raw
+        return default
+
+
+def _bg_launch(cmd, cwd=None, timeout=30):
+    """Run a `claude --bg ...` launcher and return the short id from its
+    'backgrounded · <id>' banner (or None). Output goes to a temp FILE, never a
+    pipe: when the launcher has to start Claude's background service, that
+    service inherits the launcher's stdout and holds it open forever, so
+    capture_output never sees EOF and every new chat timed out (2026-10-25)."""
+    import tempfile
+    try:
+        with tempfile.TemporaryFile("w+") as f:
+            p = subprocess.Popen(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            end = time.time() + timeout
+            while True:
+                done = p.poll() is not None
+                f.seek(0)
+                mt = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", f.read()))
+                if mt:
+                    return mt.group(1)
+                if done or time.time() > end:
+                    return None
+                time.sleep(0.1)
+    except Exception:
+        return None
+
+
+def create_bg_agent(cwd=None, effort=None, model=None):
+    """Create a new idle background agent and return its short id (or None).
+    The agent keeps running in Claude's daemon; we then attach to it so the
+    user can leave with Ctrl+Z and it stays alive. `effort`, if given, sets the
+    session's thinking level via `claude --effort <level>`."""
+    cmd = ["claude", "--bg"]
+    # New chats start in auto mode, unless the project picked its own start
+    # mode on the board ('o'), which lives in its settings.local.json.
+    perms = _load_json(Path(cwd or os.getcwd()) / ".claude" /
+                       "settings.local.json").get("permissions")
+    if not (isinstance(perms, dict) and perms.get("defaultMode")):
+        cmd += ["--permission-mode", "auto"]
+    if model and model_id(model):
+        cmd += ["--model", model_id(model)]
+    if effort:
+        cmd += ["--effort", effort]
+    return _bg_launch(cmd, cwd, 30)
+
+
+def create_bg_resume(full_id, fork=False, cwd=None, extra=None):
+    """Resume an existing (closed / settled-'done') session AS a background
+    agent and return the new short id (or None). This is what makes Ctrl+Z safe
+    for reopened chats: a foreground `claude --resume` hosts the work in its own
+    process, so the board's Ctrl+Z teardown SIGTERMs it and kills the work, but
+    a background agent runs in Claude's daemon, so attaching + Ctrl+Z merely
+    detaches and it keeps running. NOTE: `claude --bg --resume` always mints a
+    NEW session id (there is no 'background this same id' command), so the
+    continuation is a fresh session seeded with the old conversation; the caller
+    hides the old entry so it doesn't show up twice. `--fork-session` is passed
+    for an explicit fork. `extra` is appended as is (the /token account flag)."""
+    cmd = ["claude", "--bg", "--resume", full_id]
+    if fork:
+        cmd.append("--fork-session")
+    cmd += list(extra or [])
+    return _bg_launch(cmd, cwd, 60)
+
+
+def _remote_cfg_prefix(cfg):
+    """Shell prefix selecting a remote CLAUDE_CONFIG_DIR ('' = the default)."""
+    if not cfg:
+        return ""
+    if cfg.startswith("~"):
+        cfg = "$HOME" + cfg[1:]
+    return f'CLAUDE_CONFIG_DIR="{cfg}" '
+
+
+def remote_run(host, cmd, timeout=60):
+    try:
+        return subprocess.run(["ssh", host, cmd], capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 255, "", str(e))
+
+
+def remote_agents_now(host, env):
+    """Fresh sessionId -> record from the host (not the mirror, which lags)."""
+    r = remote_run(host, f"{env}claude agents --json", 20)
+    try:
+        return {x["sessionId"]: x for x in json.loads(r.stdout or "[]")
+                if isinstance(x, dict) and x.get("sessionId")}
+    except Exception:
+        return {}
+
+
+_REMOTE_TRUST_PY = r"""
+import json, os, sys
+cwd = sys.argv[1]
+for f in (os.path.expanduser("~/.claude.json")):
+    if not os.path.exists(f):
+        continue
+    d = json.load(open(f))
+    e = d.setdefault("projects", {}).setdefault(cwd, {})
+    if e.get("hasTrustDialogAccepted") is not True:
+        e["hasTrustDialogAccepted"] = True
+        tmp = f + ".trust.tmp"
+        json.dump(d, open(tmp, "w"), indent=2)
+        os.replace(tmp, f)
+"""
+
+
+def remote_trust(host, cwd):
+    """Mark cwd trusted on the host (both config dirs), like ensure_trusted()."""
+    if cwd and cwd != "(unknown)":
+        remote_run(host, f"python3 -c {shlex.quote(_REMOTE_TRUST_PY)} {shlex.quote(cwd)}", 20)
+
+
+def _remote_attach_cmd(host, cmd):
+    """The command that attaches a chat on another machine. mosh when both sides
+    have it (over a slow link ssh adds latency per keystroke; mosh echoes locally), else ssh -t.
+    mosh quotes the command itself, so the shell string goes through as one arg."""
+    import shutil
+    # A dead mosh client (laptop slept, terminal closed, network moved) leaves
+    # its mosh-server and `claude attach` running on the host forever, still
+    # hooked to the chat, and the next attach to that chat hangs (15 Nov 2026).
+    # So every open first clears old clients of the SAME chat: one he can no
+    # longer see. The chat itself keeps running; only stale viewers go.
+    m = re.search(r"claude attach (\S+)$", cmd)
+    if m:
+        cmd = (f"pkill -f {shlex.quote('^claude attach ' + m.group(1) + '$')}; "
+               "sleep 0.3; " + cmd)
+    cmd = cmd.replace("tmux attach -t ", "tmux attach -d -t ")
+    if shutil.which("mosh"):
+        # mosh drops "dim" text (SGR 2), so the grey prompt suggestion looked
+        # like typed input; mosh-dimfix on the host turns dim into grey.
+        # --predict-overwrite: inserting predictions shoved the grey suggestion
+        # right and flashed it as typed text until the server repainted.
+        return ["mosh", "--predict-overwrite", host, "--",
+                os.path.expanduser("~/bin/mosh-dimfix"), "sh", "-c", cmd]
+    return ["ssh", "-t", host, cmd]
+
+
+def open_remote_chat(app, c, action):
+    """Open / resume / fork / stop a chat that lives on another machine. Same
+    behaviour as the local paths, over ssh: attach is `ssh -t host claude attach`,
+    so Ctrl+Z detaches and the agent keeps running on the host."""
+    host = c["host"]
+    rec = app._agents.get(c["id"]) or {}
+    cfg = rec.get("config") or _load_json(PROJECT_CONFIG_DIRS_STORE).get(
+        app.tags.get(c["id"]) or "") or ""
+    env = _remote_cfg_prefix(cfg)
+    title = app.display_title(c)
+    short = short_id(c["id"], app._agents)
+    live = c["id"] in app.live_ids
+    # A chat moved with /to-server runs as a plain `claude --resume` inside tmux
+    # session chat-<8 chars> on the host (kind: interactive, no short id), so
+    # `claude attach` / `claude stop` can't reach it: open and stop it via tmux.
+    tmux = None
+    if live and rec.get("kind") == "interactive" and not rec.get("id"):
+        name = "chat-" + c["id"].split("-")[0]
+        if remote_run(host, f"tmux has-session -t {shlex.quote(name)}", 15).returncode == 0:
+            tmux = name
+    if tmux and action in ("stop", "bypass"):
+        print(f"\n■ Stopping on {host}: {title[:55]} …")
+        r = remote_run(host, f"tmux kill-session -t {shlex.quote(tmux)}", 30)
+        print("  stopped." if r.returncode == 0 else f"  couldn't confirm: {(r.stderr or r.stdout).strip()[:120]}")
+        if action == "stop":
+            time.sleep(0.7)
+            return
+        for _ in range(15):
+            if c["id"] not in remote_agents_now(host, env):
+                break
+            time.sleep(1.0)
+        live = False
+    elif tmux and action != "fork":
+        print(f"\n▶ Attaching on {host} (tmux {tmux}): {title[:55]}")
+        print("  Press Ctrl+Z to leave it running and come back.\n")
+        set_window_title(short)
+        # Ctrl+Z inside tmux would just reach claude as a byte, so the relay
+        # catches it locally; then detach the tmux client on the host so the
+        # remote side (and mosh-server) exits instead of lingering.
+        run_child_relay(_remote_attach_cmd(host, f"tmux attach -t {shlex.quote(tmux)}"))
+        remote_run(host, f"tmux detach-client -s {shlex.quote(tmux)}", 15)
+        return
+    elif tmux:
+        live = False  # fork: start a new background copy beside the tmux one
+    if action == "stop":
+        print(f"\n■ Stopping on {host}: {title[:55]} …")
+        r = remote_run(host, f"{env}claude stop {short}", 30)
+        print("  stopped." if r.returncode == 0 else f"  couldn't confirm: {(r.stderr or r.stdout).strip()[:120]}")
+        time.sleep(0.7)
+        return
+    bypass = action == "bypass"
+    if bypass and live:
+        print(f"\n■ Stopping it on {host} to reopen it with checks off …")
+        remote_run(host, f"{env}claude stop {short}", 30)
+        for _ in range(15):
+            if c["id"] not in remote_agents_now(host, env):
+                break
+            time.sleep(1.0)
+        live = False
+    if not live:
+        fork = action == "fork"
+        flags = (" --fork-session" if fork else "") + (
+            " --dangerously-skip-permissions" if bypass else "")
+        cwd = c.get("cwd") or "~"
+        remote_trust(host, cwd)
+        print(f"\n▶ {'Forking' if fork else 'Resuming'} on {host}: {title[:55]}")
+        if bypass:
+            print("  ALL permission checks OFF for this chat.")
+        r = remote_run(host, f"cd {shlex.quote(cwd)} 2>/dev/null || cd; "
+                             + _remote_bg_cmd(f"{env}claude --bg --resume {c['id']}{flags}"), 90)
+        m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
+        if not m:
+            print(f"  couldn't start it on {host}: {(r.stderr or r.stdout).strip()[:200]}")
+            input("  Press Enter to return to the board …")
+            return
+        short = m.group(1)
+        new_full = next((sid for sid, x in remote_agents_now(host, env).items()
+                         if x.get("id") == short), None)
+        if new_full:
+            _json_set(STORE, new_full, app.store.get(c["id"]) or "In Progress")
+            if app.tags.get(c["id"]):
+                _json_set(PROJECT_TAGS_STORE, new_full, app.tags[c["id"]])
+            if not fork:
+                if app.names.get(c["id"]):
+                    _json_set(NAMES_STORE, new_full, app.names[c["id"]])
+                if c["id"] in app.starred:
+                    _json_set(STARRED_STORE, new_full, True)
+                if c["id"] in app.special:
+                    _json_set(SPECIAL_STORE, new_full, True)
+                _json_set(SUPERSEDED_STORE, c["id"], new_full)
+            else:
+                _json_set(NAMES_STORE, new_full, app.unique_fork_name(title))
+    print(f"  Attaching on {host}: press Ctrl+Z to leave it running and come back.\n")
+    set_window_title(short)
+    run_child(_remote_attach_cmd(host, f"{env}claude attach {short}"))
+
+
+def _remote_bg_cmd(launch):
+    """Shell for running a `claude --bg ...` launch over ssh. The output goes to
+    a file and the launcher runs detached, because a background service started
+    by the launcher would otherwise keep ssh's channel open (see _bg_launch)."""
+    return ('f=$(mktemp); ' + launch + ' >"$f" 2>&1 </dev/null & p=$!; i=0; '
+            'until grep -qE "backgrounded.*[0-9a-f]{8}" "$f" || ! kill -0 $p 2>/dev/null || [ $i -ge 400 ]; '
+            'do sleep 0.1; i=$((i+1)); done; sleep 0.2; cat "$f"; rm -f "$f"')
+
+
+def create_remote_agent(host, cwd, env, effort=None, model=None):
+    """New background chat on another machine; returns (short, full) or (None, None)."""
+    flags = ""
+    if model and model_id(model):
+        flags += f" --model {model_id(model)}"
+    if effort:
+        flags += f" --effort {effort}"
+    remote_trust(host, cwd or str(HOME))
+    go = (f"cd {shlex.quote(cwd)} 2>/dev/null || {{ echo 'NO-SUCH-DIR' >&2; cd; }}; "
+          if cwd else "cd; ")
+    r = remote_run(host, go + _remote_bg_cmd(f"{env}claude --bg{flags}"), 60)
+    if "NO-SUCH-DIR" in r.stderr:
+        print(f"  ! {cwd} doesn't exist on {host}, so the chat starts in your home folder.")
+    m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
+    if not m:
+        return None, None
+    full = next((sid for sid, x in remote_agents_now(host, env).items()
+                 if x.get("id") == m.group(1)), None)
+    return m.group(1), full
+
+
+# /token pins ONE chat to another Claude login (an optional helper, not shipped). The
+# pin lives in ~/.claude/accounts/chat-tokens.json and travels as a per-chat
+# `--settings` file, so every way the board (re)opens a chat has to pass it on,
+# and a chat /token just restarted has to be reopened without a keypress.
+CHAT_TOKENS = HOME / ".claude" / "accounts" / "chat-tokens.json"
+CHAT_RELAUNCH = HOME / ".claude" / "accounts" / ".chat-relaunch"
+
+
+def chat_token_flags(sid):
+    """Launch flags that keep a pinned chat on its account (same session id)."""
+    try:
+        e = json.loads(CHAT_TOKENS.read_text()).get(sid) or {}
+    except Exception:
+        return []
+    f = e.get("settings")
+    if e.get("account") not in (None, "default") and f and os.path.isfile(f):
+        return ["--settings", f]
+    return []
+
+
+def chat_token_launch_flags(sid):
+    """Same, for a continuation under a NEW session id (bg reopen)."""
+    if not chat_token_flags(sid):
+        return []
+    try:
+        out = subprocess.run(["claude-token", "launch-flags", sid],
+                             capture_output=True, text=True, timeout=15)
+        flags = json.loads(out.stdout or "[]")
+        return flags if isinstance(flags, list) else []
+    except Exception:
+        return []
+
+
+def chat_token_carry(old_sid, new_sid, flags):
+    """The continuation keeps the reopened chat's /token account."""
+    if not flags:
+        return
+    try:
+        subprocess.run(["claude-token", "carry", old_sid, new_sid, flags[-1]],
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def chat_token_relaunch(sid):
+    """The relaunch claude-token asked for when it restarted this chat on
+    another account, if it is fresh: consumed on read."""
+    p = CHAT_RELAUNCH / f"{sid}.json"
+    try:
+        m = json.loads(p.read_text())
+        p.unlink()
+    except Exception:
+        return None
+    if time.time() - float(m.get("at") or 0) > 180:
+        return None
+    return m
+
+
+def start_new_chat(project_key=None, effort=None):
+    """Create a new background chat in `project_key` and attach straight to it,
+    without the board ever being drawn. This backs `claude-c --new` (Ctrl+Alt+Y):
+    the terminal opens already inside a fresh chat, and Ctrl+Z detaches and drops
+    you on the board in that same project, exactly like leaving any other chat.
+
+    No thinking-level prompt here, that would defeat "immediately", so it uses
+    the persisted default (change it with 'd<n>' on the board's normal 'n' flow).
+    Returns True if a chat was created."""
+    pj = _load_json(PROJECTS_STORE)
+    run_cwd = None
+    if project_key:
+        run_cwd = (project_key if os.path.isdir(project_key)
+                   else pj.get("cwds", {}).get(project_key))
+    if not (run_cwd and os.path.isdir(run_cwd)):
+        run_cwd = os.environ.get("CHATS_LAUNCH_CWD") or os.getcwd()
+    ensure_trusted(run_cwd)
+    effort = effort or load_effort_default()
+    model = load_model_default()
+    label = pj.get("list", {}).get(project_key) or project_key or run_cwd
+    print(f"\n▶ New background chat in {label}, {run_cwd}"
+          f" (model: {model}, thinking: {effort}) …")
+    short = create_bg_agent(run_cwd, effort, model)
+    if not short:
+        print("  Couldn't create the chat (is `claude` on PATH?), opening the board.")
+        time.sleep(1.5)
+        return False
+    full = next((s for s, r in agents_active().items()
+                 if r.get("id") == short), None)
+    if full:
+        _json_set(STORE, full, "In Progress")
+        if project_key:
+            _json_set(PROJECT_TAGS_STORE, full, project_key)
+    print("  Attaching, press Ctrl+Z to leave it running and go to the board.\n")
+    accent = None
+    if projcolor and project_key:
+        try:
+            accent = projcolor.color_for(project_key)
+        except Exception:
+            accent = None
+    set_terminal_accent(accent)
+    try:
+        run_child(["claude", "attach", short], run_cwd)
+    except FileNotFoundError:
+        print("Could not find `claude` on PATH.")
+        input("Press Enter to open the board …")
+    finally:
+        clear_terminal_accent()
+    return True
+
+
+# ── terminal-resize (SIGWINCH) relay ───────────────────────────────────────
+# THE "resizing the window garbles the chat" BUG. The kernel delivers a
+# terminal's SIGWINCH only to the FOREGROUND process group of that terminal's
+# session, and every chat we open runs in its OWN session (run_child uses
+# start_new_session=True so a stray Ctrl+Z can't tear down the board;
+# run_child_relay gives claude a private pty). So the resize signal lands on
+# the board, never on claude: claude keeps rendering at the width it read when
+# it started, every line wraps at the wrong column, and the screen turns to
+# soup until you Ctrl+Z out and reopen the chat, which only "fixes" it because
+# a fresh process reads the size again on startup.
+#
+# Measured on the real thing (`claude attach` in a pty, 100 -> 55 cols):
+# resizing produced ZERO bytes of output from claude; a single forwarded
+# SIGWINCH made it repaint the whole frame (ESC[2J + full redraw) at the new
+# width. So all we have to do is pass the signal on.
+WINCH_SETTLE = 0.18   # quiet gap that means the resize/drag has finished
+WINCH_MIN_GAP = 0.12  # mid-drag relay rate limit (~8 repaints/sec, not 60)
+
+
+@contextlib.contextmanager
+def winch_relay(nudge):
+    """Relay terminal resizes to a child that can't get them itself.
+
+    Calls nudge() on each SIGWINCH (rate-limited, so a slow window drag still
+    tracks live without making claude repaint on every one of VTE's dozens of
+    events), and then ONCE more WINCH_SETTLE seconds after the last one. That
+    last call is the settle repaint, and it's what actually wipes the garbage a
+    drag leaves behind, since only the final frame is drawn at the final size.
+
+    The debounce rides on SIGALRM because the caller is parked in waitpid() /
+    select() the whole time: signal handlers still run there, and PEP 475 makes
+    Python resume the interrupted call afterwards, so nothing else has to
+    change."""
+    last = [0.0]
+
+    def _fire():
+        last[0] = time.monotonic()
+        try:
+            nudge()
+        except Exception:
+            pass  # child already gone / tty vanished, nothing to repaint
+
+    def _on_winch(signum, frame):
+        if time.monotonic() - last[0] >= WINCH_MIN_GAP:
+            _fire()
+        signal.setitimer(signal.ITIMER_REAL, WINCH_SETTLE)  # (re)arm the settle
+
+    def _on_alarm(signum, frame):
+        _fire()  # the size stopped changing: final clean repaint
+
+    old = {}
+    try:
+        for sig, handler in ((signal.SIGWINCH, _on_winch),
+                             (signal.SIGALRM, _on_alarm)):
+            try:
+                old[sig] = signal.getsignal(sig)
+                signal.signal(sig, handler)
+            except Exception:
+                pass
+        yield
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except Exception:
+            pass
+        for sig, prev in old.items():
+            try:
+                # getsignal() returns None for a handler installed by C code
+                # (ncurses installs its own SIGWINCH); SIG_DFL for SIGWINCH is
+                # "ignore", and curses reinstalls its handler at the next
+                # initscr(), so the board keeps getting KEY_RESIZE either way.
+                signal.signal(sig, prev if prev is not None else signal.SIG_DFL)
+            except Exception:
+                pass
+
+
+def run_child(cmd, cwd=None):
+    """Run an interactive child (claude) and wait for it to truly exit. If a
+    stray Ctrl+Z ever suspends it (some claude modes re-enable job control), we
+    immediately resume it, so the board can NEVER hang on a stopped child.
+    `claude attach` is unaffected: it reads Ctrl+Z as a keystroke and exits.
+
+    start_new_session=True is critical: `claude --resume`/`--fork-session`
+    (unlike attach) treat Ctrl+Z as a real job-control SUSPEND and raise
+    SIGTSTP on their process group. Without a separate session the child shares
+    the board's group, so that SIGTSTP propagates up and tears down the whole
+    terminal (and stops the agent) instead of doing nothing. Giving the child
+    its own session contains the signal, the board and terminal always survive.
+    Verified: attach still detaches cleanly (agent keeps running) and resume
+    stays fully interactive.
+
+    The price of that separate session is that the terminal's SIGWINCH stops
+    reaching the child, so winch_relay forwards it by hand (see its comment).
+    Without that, resizing the window mid-chat leaves claude drawing at the old
+    width."""
+    p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
+
+    def _nudge():
+        # The child shares our terminal, so its own TIOCGWINSZ already reports
+        # the new size. It just never gets told to look. This is that telling.
+        os.killpg(os.getpgid(p.pid), signal.SIGWINCH)
+
+    with winch_relay(_nudge):
+        while True:
+            try:
+                _, status = os.waitpid(p.pid, os.WUNTRACED)
+            except ChildProcessError:
+                return
+            if os.WIFSTOPPED(status):
+                try:
+                    os.kill(p.pid, signal.SIGCONT)  # un-suspend and keep going
+                except Exception:
+                    pass
+                continue
+            return  # exited or killed
+
+
+def reset_tty_modes(show_cursor=True):
+    """Turn off DEC private modes a child (`claude attach` / `--resume`) can
+    leave enabled, focus reporting (?1004) and mouse tracking (?1000/2/3/6)
+    especially, plus bracketed paste (?2004). A chat that bugs out, is killed,
+    or is detached uncleanly exits WITHOUT restoring them; the curses board we
+    draw next then inherits a terminal that spews ^[[I / ^[[O (and mouse codes)
+    on every focus change, the 'random characters typing themselves' bug, which
+    the terminal-tiler's focus flips make constant. Reset them before each board
+    so leaving any chat always lands on a clean terminal."""
+    try:
+        os.write(sys.stdout.fileno(),
+                 b"\033[?1004l\033[?1000l\033[?1001l\033[?1002l\033[?1003l"
+                 b"\033[?1005l\033[?1006l\033[?1015l\033[?1007l"
+                 b"\033[?2004l" + (b"\033[?25h" if show_cursor else b""))
+    except Exception:
+        pass
+    # A chat ended by /done (SIGTERM, not a clean detach) can leave mouse codes
+    # already queued, or still arriving, from before the reset landed. Let the
+    # terminal catch up, then drop whatever input it sent in the meantime.
+    try:
+        time.sleep(0.15)
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def run_child_relay(cmd, cwd=None):
+    """Like run_child, but for `claude --resume`/`--fork-session` (CLOSED chats).
+
+    Those put the terminal in RAW mode, so Ctrl+Z is delivered to claude as a
+    plain byte (0x1A), never a signal, and claude ignores it. So there is no
+    job-control signal to catch (verified): the only way to make Ctrl+Z mean
+    "come back to the board" is to sit between the terminal and claude in a pty
+    and intercept the byte ourselves (how tmux/script work). On Ctrl+Z we tear
+    the child down and return; Ctrl-D//quit still work (claude exits → pty EOF).
+
+    Falls back to a plain run_child if stdin isn't a real tty."""
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    try:
+        old_attr = termios.tcgetattr(stdin_fd)
+    except Exception:
+        return run_child(cmd, cwd=cwd)  # not a tty, nothing to relay
+
+    master, slave = os.openpty()
+    try:
+        sz = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+    except Exception:
+        sz = struct.pack("HHHH", 40, 120, 0, 0)
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, sz)
+    except Exception:
+        pass
+
+    def _pre():
+        os.setsid()
+        try:
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)  # pty becomes claude's own ctty
+        except Exception:
+            pass
+
+    p = subprocess.Popen(cmd, cwd=cwd, stdin=slave, stdout=slave, stderr=slave,
+                         preexec_fn=_pre, close_fds=True)
+    os.close(slave)
+
+    def _nudge():
+        # Copy the real terminal's size onto claude's pty (which is what its
+        # TIOCGWINSZ reads) and then poke it, so a resize mid-chat repaints at
+        # the new width instead of wrapping into garbage. winch_relay adds the
+        # settle repaint once the drag stops.
+        s = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, s)
+        os.killpg(os.getpgid(p.pid), signal.SIGWINCH)
+
+    try:
+        tty.setraw(stdin_fd)
+        with winch_relay(_nudge):
+            while True:
+                try:
+                    rs, _, _ = select.select([stdin_fd, master], [], [], 0.2)
+                except (OSError, select.error):
+                    continue
+                if stdin_fd in rs:
+                    try:
+                        data = os.read(stdin_fd, 65536)
+                    except OSError:
+                        data = b""
+                    if data:
+                        if b"\x1a" in data:              # Ctrl+Z → back to board
+                            pre = data.split(b"\x1a", 1)[0]
+                            if pre:
+                                os.write(master, pre)
+                            break
+                        os.write(master, data)
+                if master in rs:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break                            # claude closed the pty
+                    os.write(stdout_fd, data)
+                if p.poll() is not None:
+                    try:                                 # drain anything left
+                        while True:
+                            d = os.read(master, 65536)
+                            if not d:
+                                break
+                            os.write(stdout_fd, d)
+                    except OSError:
+                        pass
+                    break
+    finally:
+        try:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
+        except Exception:
+            pass
+        if p.poll() is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        try:
+            os.close(master)
+        except Exception:
+            pass
+
+
+def main():
+    # Make the board immune to Ctrl+Z (SIGTSTP) so it can never be suspended -
+    # e.g. an extra Ctrl+Z after detaching from an agent. Children reset this
+    # via _child_preexec so `claude attach` keeps Ctrl+Z for detaching.
+    try:
+        signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    except Exception:
+        pass
+
+    if not PROJECTS_DIR.exists():
+        print("No Claude projects directory found at", PROJECTS_DIR)
+        return
+
+    # Command line:
+    #   claude-c <project>          open the board straight in that project
+    #   claude-c <project> -n       skip the board: create a fresh background chat
+    #   claude-c -n [<project>]     in that project and attach to it right away.
+    # The flags are position-free on purpose: `claude-c system -n` and
+    # `claude-c -n system` do the same thing, because the natural way to type it
+    # is to name the project first and only then decide you want a new chat.
+    # The project is free text, a display name ("system", "myapp"), a folder
+    # basename, a path, or "all" for the unfiltered board, resolved against the
+    # same project list the P panel shows. Ctrl+Z out of the chat lands on the
+    # board in that project.
+    argv = sys.argv[1:]
+    boot_new = False
+    boot_project = str(HOME)
+    proj_arg = None
+
+    # `--open <id>`, used by session restore (`claude-session`). Boot straight
+    # into that chat instead of the board, so the terminals you had open before
+    # a logout come back showing the same conversations.
+    boot_open = None
+    if "--open" in argv:
+        i = argv.index("--open")
+        if i + 1 < len(argv):
+            boot_open = argv[i + 1]
+            del argv[i:i + 2]
+        else:
+            print("--open needs a chat id")
+            sys.exit(2)
+
+    NEW_FLAGS = ("--new", "-n", "--new-chat")
+    HELP_FLAGS = ("-h", "--help", "help")
+    LIST_FLAGS = ("-l", "--list", "--projects")
+
+    if any(a in HELP_FLAGS for a in argv):
+        print(__doc__.strip())
+        return
+    if any(a in LIST_FLAGS for a in argv):
+        for key, name in sorted(project_candidates(deep=True),
+                                key=lambda kn: kn[1].lower()):
+            print(f"{name:<24} {key}")
+        return
+
+    boot_new = any(a in NEW_FLAGS for a in argv)
+    rest = [a for a in argv if a and a not in NEW_FLAGS]
+    unknown = [a for a in rest if a.startswith("-") and a != "-"]
+    if unknown:
+        print(f"Unknown option: {unknown[0]}   (try `claude-c --help`)")
+        sys.exit(2)
+    # Unquoted multi-word names ("claude-c my project") arrive as separate
+    # argv entries; join them back before matching.
+    proj_arg = " ".join(rest).strip() or None
+
+    boot_view = _KEEP_PROJECT
+    if boot_open:
+        # Restore opens by id, and the board's persisted project filter would
+        # happily hide that chat. Show all projects so it is always findable.
+        # None is the "All projects" value here, the "__all__" string is only
+        # how it is spelled in the persisted json, and passing that through as a
+        # project key selects a project by that literal name, i.e. nothing.
+        boot_view = None
+    if proj_arg:
+        ok, key, matches = resolve_project(proj_arg)
+        if not ok:
+            if matches:
+                print(f"“{proj_arg}” matches several projects:")
+                for k, n in matches:
+                    print(f"  {n:<24} {k}")
+            else:
+                print(f"No project matches “{proj_arg}”. Known projects:")
+                for k, n in sorted(project_candidates(deep=True),
+                                   key=lambda kn: kn[1].lower()):
+                    print(f"  {n:<24} {k}")
+            sys.exit(1)
+        if boot_new:
+            # "All projects" isn't a place to put a new chat, fall back to the
+            # launch folder, exactly like a bare --new.
+            boot_project = key
+        else:
+            boot_view = key
+
+    # Account-bound project: hand the whole board over to that account before
+    # anything is drawn, so every child process inherits it. One re-exec max:
+    # the guard variable stops a loop if the binding somehow never takes.
+    target = boot_view if boot_view not in (_KEEP_PROJECT, None) else (
+        boot_project if boot_new else None)
+    bound = config_dir_for_project(target)
+    if bound and not os.environ.get("CHATS_ACCOUNT_REEXEC"):
+        if os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or "") != os.path.realpath(bound):
+            os.environ["CLAUDE_CONFIG_DIR"] = bound
+            os.environ["CHATS_ACCOUNT_REEXEC"] = "1"
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                          os.environ)
+            except Exception:
+                pass
+
+    last_id = boot_open
+    # One-shot: only the FIRST board pass auto-opens. Coming back from that chat
+    # (Ctrl+Z) must land on the board, not bounce straight back into the chat.
+    boot_open_once = [True] if boot_open else []
+    # Project to restore when the board reopens after a chat. _KEEP_PROJECT on
+    # the first launch (use whatever's persisted); after a chat it becomes the
+    # project the board was showing, so Ctrl+Z always returns you to the SAME
+    # project screen you left, never the chat's own project. A project named on
+    # the command line overrides the persisted one for this launch.
+    last_project = boot_view
+
+    if boot_new:
+        start_new_chat(boot_project)
+        # Whether or not the chat came up, the board that follows opens on the
+        # requested project, that's the "straight into System" half of the ask.
+        last_project = boot_project
+    while True:
+        # Every child (attach/resume/fork) can leave the terminal in focus-
+        # reporting / mouse mode; scrub those before drawing the board so we
+        # never inherit a terminal that spews escape codes on focus changes.
+        reset_tty_modes()
+        holder = {}
+
+        def _run(stdscr):
+            app = App(stdscr, select_id=last_id, select_project=last_project,
+                      auto_open=boot_open_once.pop() if boot_open_once else False)
+            app.run()
+            holder["app"] = app
+
+        curses.wrapper(_run)
+        app = holder.get("app")
+        if not app:
+            return
+        # Remember the project the board was showing so EVERY path below
+        # (resume/attach/fork/new/stop) returns you to that same project screen
+        #, not the chat's own project. This is the whole Ctrl+Z fix.
+        last_project = app.active_project
+
+        # Ctrl+R, reload the script itself by re-executing (picks up code edits).
+        if getattr(app, "reload", False):
+            # Keep the project the board was started on; drop one-shot flags.
+            keep, skip = [], False
+            for a in sys.argv[1:]:
+                if skip:
+                    skip = False
+                    continue
+                if a == "--open":
+                    skip = True
+                    continue
+                if a in ("--new", "-n", "--new-chat"):
+                    continue
+                keep.append(a)
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + keep)
+
+        # 'n', start a new chat as a BACKGROUND AGENT, then attach. This way the
+        # user can leave with Ctrl+Z and the agent keeps running (just like the
+        # existing live agents), instead of Ctrl-D stopping the work.
+        if getattr(app, "new_chat", False):
+            new_cwd = app.project_cwd(app.active_project) or app.start_cwd
+            run_cwd = new_cwd if (new_cwd and os.path.isdir(new_cwd)) else None
+            ensure_trusted(run_cwd)
+            effort = prompt_effort()
+            model = prompt_model()
+            if model == "fable" and effort in ("low", "medium"):
+                print("  ! fable on a light thinking level: opus is usually enough for that.")
+            hosts = [h for h, _ in remote_project_roots()]
+            where = ""
+            if hosts:
+                where = input(f"  Run it on [l]aptop or [s]erver ({hosts[0]})?"
+                              "  Enter = laptop: ").strip().lower()
+            if where.startswith("s") and hosts:
+                host = hosts[0]
+                # A folder project may exist only on the server (code that moved
+                # there), so the local isdir() check above can't decide its cwd:
+                # use the project folder as is and let the server cd into it.
+                key = app.active_project
+                if key and os.path.isabs(key):
+                    new_cwd = key
+                env = _remote_cfg_prefix(_load_json(PROJECT_CONFIG_DIRS_STORE).get(
+                    app.active_project or "") or "")
+                print(f"\n▶ Creating a new background chat on {host}"
+                      f"{f' in {new_cwd}' if new_cwd else ''} (model: {model}, thinking: {effort}) …")
+                short, full = create_remote_agent(host, new_cwd, env, effort, model)
+                if not short:
+                    print(f"  Couldn't create the chat on {host}.")
+                    input("  Press Enter to return to the menu …")
+                    continue
+                if full:
+                    _json_set(STORE, full, "In Progress")
+                    if app.active_project:
+                        _json_set(PROJECT_TAGS_STORE, full, app.active_project)
+                print("  Attaching: press Ctrl+Z to leave it running and come back.\n")
+                set_window_title(short)
+                run_child(_remote_attach_cmd(host, f"{env}claude attach {short}"))
+                continue
+            print(f"\n▶ Creating a new background chat"
+                  f"{f' in {run_cwd}' if run_cwd else ''}"
+                  f" (model: {model}, thinking: {effort}) …")
+            short = create_bg_agent(run_cwd, effort, model)
+            if not short:
+                print("  Couldn't create the chat (is `claude` on PATH?).")
+                input("  Press Enter to return to the menu …")
+                continue
+            full = next((s for s, r in agents_active().items()
+                         if r.get("id") == short), None)
+            if full:
+                _json_set(STORE, full, "In Progress")
+                if app.active_project:  # keep new chats inside the active project
+                    _json_set(PROJECT_TAGS_STORE, full, app.active_project)
+            print("  Attaching, press Ctrl+Z to leave it running and come back.\n")
+            set_terminal_accent(app.project_color(app.active_project))
+            set_window_title(short)
+            try:
+                run_child(["claude", "attach", short], run_cwd)
+            except FileNotFoundError:
+                print("Could not find `claude` on PATH.")
+                input("Press Enter to return to the menu …")
+            finally:
+                clear_terminal_accent()
+            continue
+
+        if not app.resume_target:
+            return  # user pressed q, leave the board
+
+        # Run the chosen chat as a sub-process so we return here when it exits.
+        c = app.resume_target
+        action = getattr(app, "resume_action", "resume")
+        last_id = c["id"]
+        cwd = c["cwd"]
+        run_cwd = cwd if (cwd and cwd != "(unknown)" and os.path.isdir(cwd)) else None
+        short = short_id(c["id"], app._agents)
+
+        # A chat living on another machine (an ssh host): everything
+        # happens over ssh there, including its account, so none of the local
+        # account/resume logic below applies.
+        if c.get("host"):
+            try:
+                open_remote_chat(app, c, action)
+            except FileNotFoundError:
+                print("Could not find `ssh` on PATH.")
+                input("Press Enter to return to the menu …")
+            continue
+
+        # Account-bound project (a second account): this chat belongs to a different
+        # Claude login, and opening it from a board running on the default one
+        # would bill the wrong account and register the agent with the wrong
+        # daemon. Hand the whole board over to that account and come straight
+        # back into this chat, instead of quietly doing the wrong thing.
+        want = config_dir_for_project(app.tags.get(c["id"]))
+        if (want and action != "stop"
+                and os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or "")
+                != os.path.realpath(want)):
+            print(f"\n▶ {app.display_title(c)[:55]}")
+            print(f"  runs on another Claude account ({os.path.basename(want)})"
+                  ": switching the board over …")
+            os.environ["CLAUDE_CONFIG_DIR"] = want
+            os.environ["CHATS_ACCOUNT_REEXEC"] = "1"
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, os.path.abspath(__file__),
+                           "--open", c["id"]], os.environ)
+            except Exception:
+                print("  couldn't switch accounts, so not opening it on the wrong one.")
+                input("  Press Enter to return to the board …")
+                continue
+
+        # A live background agent must ALWAYS be attached, never resumed. The
+        # board's live-agent set (self.live_ids) is refreshed on a throttle, so
+        # by the time you hit Enter it can be a couple of seconds stale and miss
+        # an agent that only just came alive. Such an agent would then take the
+        # `claude --resume` path, which runs through the pty relay whose Ctrl+Z
+        # teardown SIGTERMs the child's process group, and THAT is what stops a
+        # running agent (the attach path only ever SIGCONTs, so it can never kill
+        # one). Re-check the authoritative live set here, falling back to the
+        # board's last snapshot if the query fails, and force attach, so a stale
+        # mis-classification can never let Ctrl+Z kill a live agent. (Explicit
+        # fork/stop actions are the user's choice and left untouched.)
+        if action == "resume":
+            live_now = agents_active()
+            if c["id"] in live_now or c["id"] in app.live_ids:
+                # ...unless a headless `--resume -p` run owns it, in which case
+                # attach cannot work at all and forcing it is what produced the
+                # silent bounce back to the board.
+                if headless_holder(c["id"], live_now or app._agents):
+                    action = "headless"
+                else:
+                    action = "attach"
+                    short = short_id(c["id"], live_now or app._agents)
+
+        # 'headless': the chat is owned by a `claude --resume <id> -p` run.
+        # Attach is impossible (no pty host) and a plain resume would be forced
+        # into that same dead attach, so the board used to just blink and come
+        # back. Say what is holding it and offer the only two real ways out.
+        if action == "headless":
+            pid = headless_holder(c["id"], agents_active() or app._agents)
+            if not pid:
+                # It exited between the keypress and here: a normal chat now.
+                action = "resume"
+            else:
+                age = headless_holder_age(pid)
+                print(f"\n■ {app.display_title(c)[:60]}")
+                print(f"  This chat is being driven by a headless "
+                      f"`claude --resume -p` run (pid {pid}, going {age}).")
+                print("  That kind of run owns the session but has no terminal to")
+                print("  attach to, which is why opening it does nothing.\n")
+                print("  [t] take it back: end that run, reopen the chat properly")
+                print("  [f] fork a copy: leave it running, open a copy alongside")
+                print("  [Enter] leave it alone\n")
+                choice = (input("  Choice: ").strip().lower() or "")
+                if choice == "t":
+                    print("  Ending the headless run …")
+                    if kill_headless_holder(pid):
+                        # Wait for Claude to actually drop the session from its
+                        # agent list. `--resume` refuses a session the daemon
+                        # still thinks is registered, and deregistration lags
+                        # the process death by a moment.
+                        for _ in range(10):
+                            if c["id"] not in agents_active():
+                                break
+                            time.sleep(1.0)
+                        print("  done, reopening the chat.")
+                        action = "resume"
+                    else:
+                        print(f"  couldn't end pid {pid}; leaving it alone.")
+                        input("  Press Enter to return to the board …")
+                        continue
+                elif choice == "f":
+                    action = "fork"
+                else:
+                    continue
+
+        # 'bypass': reopen with --dangerously-skip-permissions. A live agent
+        # can't change mode, so stop it, wait for the daemon to drop it, resume.
+        bypass = (action == "bypass")
+        if bypass:
+            live_now = agents_active()
+            if c["id"] in live_now or c["id"] in app.live_ids:
+                print(f"\n■ Stopping the live agent to reopen it with checks off: "
+                      f"{app.display_title(c)[:45]} …")
+                stop_agent(short_id(c["id"], live_now or app._agents))
+                for _ in range(15):
+                    if c["id"] not in agents_active():
+                        break
+                    time.sleep(1.0)
+            action = "resume"
+
+        # 'stop' just ends a live agent, then returns to the board.
+        if action == "stop":
+            print(f"\n■ Stopping background agent: {c['title'][:55]} …")
+            ok = stop_agent(short)
+            print("  stopped." if ok else "  couldn't confirm it stopped.")
+            time.sleep(0.7)
+            continue
+
+        # Trust the folder once so Claude doesn't re-ask "trust this folder?".
+        ensure_trusted(run_cwd)
+
+        title = app.display_title(c)
+        run_id = c["id"]  # the session actually run below (bg-resume mints a new one)
+        # If this is a resume, we DON'T hide the original yet, we wait until the
+        # session actually gets a real user turn. pending_resume carries what we'd
+        # need to finalize (hide old) or undo (drop the empty phantom) on return.
+        pending_resume = None  # (old_id, new_full, new_short)
+        if action == "attach":
+            # Direct attach to the LIVE agent. It keeps running; detach with
+            # Ctrl+Z (claude attach handles the keystroke itself) to come back.
+            cmd = ["claude", "attach", short]
+            runner = run_child
+            print(f"\n▶ Attaching to live agent: {title[:60]}")
+            print("  (press Ctrl+Z to detach and come back, the agent KEEPS RUNNING)\n")
+        else:
+            # resume (continue a closed/settled chat) or fork (explicit copy).
+            # A foreground `claude --resume` hosts the work in its own process, so
+            # the board's Ctrl+Z teardown SIGTERMs it and the running turn dies
+            # ("stops like Ctrl+C"). Instead, resume the session AS A BACKGROUND
+            # agent and attach to it, then Ctrl+Z just detaches and it keeps
+            # running, exactly like a live agent or a new (`n`) chat. Downside:
+            # Claude can only background a session under a NEW id, so we copy the
+            # old chat's name/category/project onto the continuation and hide the
+            # old entry (resume) so it doesn't show up twice.
+            fork = (action == "fork")
+            print(f"\n▶ {'Forking' if fork else 'Resuming'} in the background: {title[:55]}")
+            tok_flags = [] if fork else chat_token_launch_flags(c["id"])
+            bypass_flags = ["--dangerously-skip-permissions"] if bypass else []
+            if bypass:
+                print("  ALL permission checks OFF for this chat.")
+            new_short = create_bg_resume(c["id"], fork=fork, cwd=run_cwd,
+                                         extra=tok_flags + bypass_flags)
+            new_full = None
+            if new_short:
+                new_full = next((s for s, r in agents_active().items()
+                                 if r.get("id") == new_short), None)
+            if new_short and new_full:
+                # Carry the old chat's identity onto the continuation: category
+                # and project for both, but the custom NAME only for a resume -
+                # a fork is a deliberate second copy and shouldn't clone the
+                # original's name (that would show two identically-named chats).
+                _json_set(STORE, new_full,
+                          app.store.get(c["id"]) or "In Progress")
+                old_tag = app.tags.get(c["id"])
+                if old_tag:
+                    _json_set(PROJECT_TAGS_STORE, new_full, old_tag)
+                if not fork:
+                    old_name = app.names.get(c["id"])
+                    if old_name:
+                        _json_set(NAMES_STORE, new_full, old_name)
+                    if c["id"] in app.starred:
+                        _json_set(STARRED_STORE, new_full, True)
+                    if c["id"] in app.special:
+                        _json_set(SPECIAL_STORE, new_full, True)
+                    # Record the link NOW so the original folds away the moment
+                    # the continuation has real content, otherwise the two sit
+                    # side by side as a duplicate for the whole session. This is
+                    # SAFE because rescan()'s guard only actually hides the
+                    # original once the continuation exists on disk: a resume you
+                    # open and never type into writes no file, so it can't hide
+                    # anything. pending_resume lets us undo this on return if the
+                    # resume turned out empty.
+                    _json_set(SUPERSEDED_STORE, c["id"], new_full)
+                    pending_resume = (c["id"], new_full, new_short)
+                    chat_token_carry(c["id"], new_full, tok_flags)
+                else:
+                    _json_set(NAMES_STORE, new_full, app.unique_fork_name(title))
+                run_id = new_full
+                last_id = new_full
+                short = new_short
+                cmd = ["claude", "attach", new_short]
+                runner = run_child
+                print("  (press Ctrl+Z to leave it running and come back, "
+                      "the agent KEEPS RUNNING)\n")
+            else:
+                # Couldn't background it, fall back to the old foreground path so
+                # the chat still opens. Here Ctrl+Z ends the current step (there's
+                # no daemon behind a foreground session to keep it running).
+                cmd = ["claude", "--resume", c["id"]] + (
+                    ["--fork-session"] if fork else chat_token_flags(c["id"])) + bypass_flags
+                runner = run_child_relay
+                print("  (couldn't background it; opening in the foreground, "
+                      "Ctrl+Z / Ctrl-D / quit to come back)\n")
+
+        # NOTE: we intentionally do NOT change last_project here. It already
+        # holds the project the board was showing (captured above), so returning
+        # from this chat lands back on that SAME project screen, never the
+        # chat's own project, which used to throw you onto the wrong screen.
+
+        # Diagnostic trace (no-op unless ctrlz-debug.on exists). Records what we
+        # ran and whether Claude still counts the agent as LIVE right before vs
+        # right after the child returns, the smoking gun for "Ctrl+Z stopped my
+        # agent" (live_before=True, live_after=False) versus the daemon's later
+        # idle settle (both True; it drops to done minutes afterwards instead).
+        dbg_on = CTRLZ_DEBUG_FLAG.exists()
+        t_open = time.time()
+        before = (None, None, None)
+        if dbg_on:
+            try:
+                tty = os.ttyname(sys.stdin.fileno())
+            except Exception:
+                tty = "?"
+            before = _agent_snapshot(run_id)
+            _dbg(f"OPEN   action={action} short={short} run_id={run_id[:8]} "
+                 f"orig={c['id'][:8]} title={title[:40]!r} "
+                 f"before(live,status,state)={before} "
+                 f"tty={tty} term={os.environ.get('TERM', '?')} "
+                 f"board_pid={os.getpid()}")
+
+        # Tint the terminal's cursor with the project's color for as long as the
+        # chat is up, so the cue stays with you inside the chat and not just on
+        # the board. Always cleared on the way back out (finally), even if the
+        # chat crashes, the terminal never keeps a stale project color.
+        set_terminal_accent(app.project_color(project_key_for(c, app.tags)))
+        set_window_title(run_id)   # so `claude-session` can find this window
+        try:
+            runner(cmd, run_cwd)
+            # /token restarted this chat on another account: go straight back
+            # in (reattach the restarted agent, or reopen the terminal chat
+            # with its new flags) instead of dropping to the board.
+            nxt = chat_token_relaunch(run_id)
+            while nxt:
+                if nxt.get("attach"):
+                    for _ in range(40):
+                        if any(r.get("id") == nxt["attach"]
+                               for r in agents_active().values()):
+                            break
+                        time.sleep(0.5)
+                    print(f"\n▶ Back into the chat, now on {nxt.get('account')} …\n")
+                    run_child(["claude", "attach", nxt["attach"]], run_cwd)
+                else:
+                    print(f"\n▶ Reopening the chat on {nxt.get('account')} …\n")
+                    run_child_relay(["claude", "--resume", run_id]
+                                    + list(nxt.get("flags") or [])
+                                    + ([nxt["prompt"]] if nxt.get("prompt") else []),
+                                    run_cwd)
+                nxt = chat_token_relaunch(run_id)
+            if c.get("path"):
+                remember_title(Path(c["path"]).parent / f"{run_id}.jsonl",
+                               *{c["id"], run_id})
+        except FileNotFoundError:
+            print("Could not find the `claude` command on PATH.")
+            print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
+            input("Press Enter to return to the menu …")
+        finally:
+            clear_terminal_accent()
+
+        # Finalize a resume now that the chat has closed. THE FIX for "I opened a
+        # past chat, wrote nothing, went back, and it vanished": if the resume
+        # never got a real user turn it produced nothing, so tear the whole thing
+        # down, drop the supersede link, stop the empty phantom agent, and clear
+        # its copied metadata, leaving the original exactly as it was, as if it
+        # had never been opened. (rescan()'s guard already keeps the original
+        # visible meanwhile, since an empty resume writes no file to hide it
+        # behind; this just stops the debris from piling up.)
+        if pending_resume:
+            old_id, cont_full, cont_short = pending_resume
+            has_turn = session_has_user_turn(cont_full)
+            if not has_turn:
+                time.sleep(0.4)  # let a just-submitted turn's file land, then re-check
+                has_turn = session_has_user_turn(cont_full)
+            if not has_turn:
+                _json_set(SUPERSEDED_STORE, old_id, None)  # un-link: nothing replaced it
+                stop_agent(cont_short)                     # kill the empty phantom agent
+                _json_set(STORE, cont_full, None)          # drop its copied metadata
+                _json_set(PROJECT_TAGS_STORE, cont_full, None)
+                _json_set(NAMES_STORE, cont_full, None)
+                _json_set(STARRED_STORE, cont_full, None)
+                _json_set(SPECIAL_STORE, cont_full, None)
+                last_id = old_id  # keep the cursor on the original, not the phantom
+
+        if dbg_on:
+            after = _agent_snapshot(run_id)
+            note = ""
+            if before[0] and not after[0]:
+                note = "   <<< AGENT KILLED ON RETURN (live -> gone)"
+            elif before[0] and after[0] and before[1] == "busy" and after[1] != "busy":
+                note = ("   <<< AGENT INTERRUPTED ON RETURN "
+                        "(busy -> idle, the running turn was cancelled, like Ctrl+C)")
+            _dbg(f"RETURN action={action} short={short} run_id={run_id[:8]} "
+                 f"after(live,status,state)={after} secs={time.time() - t_open:.0f}{note}")
+        # loop returns to the board automatically; flushinp() in run() drops
+        # any keys buffered while the sub-process was up so we never auto-loop.
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

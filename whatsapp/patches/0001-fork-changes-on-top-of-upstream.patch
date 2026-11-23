@@ -1,0 +1,1314 @@
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index d1e0270..32fd7cf 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"math"
+ 	"math/rand"
+ 	"net/http"
+@@ -13,6 +14,8 @@ import (
+ 	"os/signal"
+ 	"path/filepath"
+ 	"reflect"
++	"sort"
++	"strconv"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -23,7 +26,9 @@ import (
+ 	"bytes"
+ 
+ 	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
+ 	waProto "go.mau.fi/whatsmeow/binary/proto"
++	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+ 	"go.mau.fi/whatsmeow/store/sqlstore"
+ 	"go.mau.fi/whatsmeow/types"
+ 	"go.mau.fi/whatsmeow/types/events"
+@@ -185,14 +190,118 @@ func extractTextContent(msg *waProto.Message) string {
+ 		return extendedText.GetText()
+ 	}
+ 
+-	// For now, we're ignoring non-text messages
++	// Multiple-choice messages from business bots (lists, buttons, templates,
++	// interactive). Before 4 Nov 2026 these were dropped, so a bot's menu never
++	// reached anyone. Rendered as text with the choices listed.
++	if t := extractChoiceText(msg); t != "" {
++		return t
++	}
++	// Wrapped messages: unwrap and try again.
++	for _, inner := range []*waProto.Message{
++		msg.GetViewOnceMessage().GetMessage(), msg.GetViewOnceMessageV2().GetMessage(),
++		msg.GetEphemeralMessage().GetMessage(), msg.GetDocumentWithCaptionMessage().GetMessage(),
++		msg.GetDeviceSentMessage().GetMessage(),
++	} {
++		if inner != nil {
++			if t := extractTextContent(inner); t != "" {
++				return t
++			}
++		}
++	}
+ 	return ""
+ }
+ 
++func extractChoiceText(msg *waProto.Message) string {
++	var b strings.Builder
++	line := func(s string) {
++		if s = strings.TrimSpace(s); s != "" {
++			if b.Len() > 0 {
++				b.WriteString("\n")
++			}
++			b.WriteString(s)
++		}
++	}
++	if l := msg.GetListMessage(); l != nil {
++		line(l.GetTitle())
++		line(l.GetDescription())
++		line(l.GetFooterText())
++		for _, sec := range l.GetSections() {
++			line(sec.GetTitle())
++			for _, r := range sec.GetRows() {
++				line("[choice] " + r.GetTitle() + "  " + r.GetDescription())
++			}
++		}
++		if l.GetButtonText() != "" {
++			line("(list button: " + l.GetButtonText() + ")")
++		}
++	}
++	if bm := msg.GetButtonsMessage(); bm != nil {
++		line(bm.GetContentText())
++		line(bm.GetFooterText())
++		for _, btn := range bm.GetButtons() {
++			line("[choice] " + btn.GetButtonText().GetDisplayText())
++		}
++	}
++	if tm := msg.GetTemplateMessage(); tm != nil {
++		ht := tm.GetHydratedTemplate()
++		line(ht.GetHydratedTitleText())
++		line(ht.GetHydratedContentText())
++		line(ht.GetHydratedFooterText())
++		for _, hb := range ht.GetHydratedButtons() {
++			if q := hb.GetQuickReplyButton(); q != nil {
++				line("[choice] " + q.GetDisplayText())
++			} else if u := hb.GetUrlButton(); u != nil {
++				line("[link] " + u.GetDisplayText() + " " + u.GetURL())
++			}
++		}
++	}
++	if im := msg.GetInteractiveMessage(); im != nil {
++		line(im.GetHeader().GetTitle())
++		line(im.GetBody().GetText())
++		line(im.GetFooter().GetText())
++		for _, nb := range im.GetNativeFlowMessage().GetButtons() {
++			var p struct {
++				DisplayText string `json:"display_text"`
++				Title       string `json:"title"`
++				Sections    []struct {
++					Title string `json:"title"`
++					Rows  []struct {
++						Title       string `json:"title"`
++						Description string `json:"description"`
++					} `json:"rows"`
++				} `json:"sections"`
++			}
++			_ = json.Unmarshal([]byte(nb.GetButtonParamsJSON()), &p)
++			if p.DisplayText != "" {
++				line("[choice] " + p.DisplayText)
++			}
++			if p.Title != "" {
++				line("(menu: " + p.Title + ")")
++			}
++			for _, sec := range p.Sections {
++				line(sec.Title)
++				for _, r := range sec.Rows {
++					line("[choice] " + r.Title + "  " + r.Description)
++				}
++			}
++		}
++	}
++	if r := msg.GetListResponseMessage(); r != nil {
++		line(r.GetTitle())
++	}
++	if r := msg.GetButtonsResponseMessage(); r != nil {
++		line(r.GetSelectedDisplayText())
++	}
++	return b.String()
++}
++
+ // SendMessageResponse represents the response for the send message API
+ type SendMessageResponse struct {
+ 	Success bool   `json:"success"`
+ 	Message string `json:"message"`
++	// ID of the message just sent. Without it a message we send is anonymous to
++	// us, so nothing can react to it, quote it or track it afterwards.
++	ID string `json:"id,omitempty"`
+ }
+ 
+ // SendMessageRequest represents the request body for the send message API
+@@ -200,33 +309,215 @@ type SendMessageRequest struct {
+ 	Recipient string `json:"recipient"`
+ 	Message   string `json:"message"`
+ 	MediaPath string `json:"media_path,omitempty"`
++	// Optional: quote/reply to an existing message. QuotedID is the WhatsApp
++	// message id being replied to, QuotedSender the (stored) sender of that
++	// message, QuotedText the text shown in the quoted bubble.
++	QuotedID     string `json:"quoted_id,omitempty"`
++	QuotedSender string `json:"quoted_sender,omitempty"`
++	QuotedText   string `json:"quoted_text,omitempty"`
++	// Record this send in the local messages DB as well as putting it on
++	// WhatsApp. Off by default: the bridge normally only stores what it
++	// *receives*, and WhatsApp never echoes a message back to the device that
++	// sent it, so an API send is invisible to every local reader. Anything that
++	// speaks for the user through this API (any front door typing into the
++	// "My Claude" group) must set this, or the bot polling messages.db will
++	// never see the message and will look dead.
++	StoreLocal bool `json:"store_local,omitempty"`
++	// Which side a logged file belongs to in the bot's transcript. The
++	// "My Claude" group is a self-chat, so both the user and the bot send as the
++	// same account and nothing in the protocol distinguishes them. Empty means
++	// "assistant", which is right for every automated sender.
++	HistoryRole string `json:"history_role,omitempty"`
++}
++
++// keepSentMedia parks a copy of a sent file in a cache the history log can
++// safely point at forever, and keeps that cache under a size ceiling by
++// dropping the oldest copies. Returns "" when the copy failed, in which case
++// the caller logs the original path: a possibly-stale attachment still beats no
++// attachment at all.
++func keepSentMedia(src string) string {
++	dir := os.Getenv("BRIDGE_MEDIA_KEEP_DIR")
++	if dir == "" {
++		return ""
++	}
++	if strings.HasPrefix(src, dir+string(os.PathSeparator)) {
++		return src // already ours, sending it again shouldn't clone it
++	}
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		fmt.Println("media keep: cannot create dir:", err)
++		return ""
++	}
++	in, err := os.Open(src)
++	if err != nil {
++		return ""
++	}
++	defer in.Close()
++	dst := filepath.Join(dir, fmt.Sprintf("%d-%s", time.Now().UnixMilli(), filepath.Base(src)))
++	out, err := os.Create(dst)
++	if err != nil {
++		fmt.Println("media keep: cannot write:", err)
++		return ""
++	}
++	if _, err := io.Copy(out, in); err != nil {
++		out.Close()
++		os.Remove(dst)
++		fmt.Println("media keep: copy failed:", err)
++		return ""
++	}
++	out.Close()
++	pruneSentMedia(dir)
++	return dst
++}
++
++// pruneSentMedia drops the oldest kept copies once the cache passes its ceiling
++// (2 GB by default, roughly a hundred APKs). Old attachments in a companion UI then
++// stop downloading, which is the right trade against filling the disk.
++func pruneSentMedia(dir string) {
++	limit := int64(2 << 30)
++	if v := os.Getenv("BRIDGE_MEDIA_KEEP_BYTES"); v != "" {
++		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
++			limit = n
++		}
++	}
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return
++	}
++	type kept struct {
++		path string
++		mod  time.Time
++		size int64
++	}
++	var files []kept
++	var total int64
++	for _, e := range entries {
++		info, ierr := e.Info()
++		if ierr != nil || e.IsDir() {
++			continue
++		}
++		files = append(files, kept{filepath.Join(dir, e.Name()), info.ModTime(), info.Size()})
++		total += info.Size()
++	}
++	if total <= limit {
++		return
++	}
++	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
++	for _, f := range files {
++		if total <= limit {
++			return
++		}
++		if err := os.Remove(f.path); err == nil {
++			total -= f.size
++			fmt.Println("media keep: pruned", filepath.Base(f.path))
++		}
++	}
++}
++
++// appendMediaHistory records a file sent into the watched chat in the bot's
++// history log. A companion phone UI reads that log and nothing else, so a file missing
++// from it is invisible on the phone no matter who sent it: the bot, this API, or
++// a Claude session going through the MCP tools. Only the text of a message was
++// ever logged, which is exactly why every APK sent into the group vanished.
++// Best-effort by design: a failure here must never fail the send.
++func appendMediaHistory(recipientJID, mediaPath, caption, role, id string) {
++	logPath := os.Getenv("BRIDGE_MEDIA_LOG")
++	want := os.Getenv("BRIDGE_MEDIA_LOG_JID")
++	if logPath == "" || want == "" || recipientJID != want || mediaPath == "" {
++		return
++	}
++	abs, err := filepath.Abs(mediaPath)
++	if err != nil {
++		abs = mediaPath
++	}
++	// Label it with the name he sent it under, before the path turns into a
++	// cache copy with a timestamp glued to the front.
++	text := strings.TrimSpace(caption)
++	if text == "" {
++		text = "📎 " + filepath.Base(abs)
++	}
++	// Point the log at a copy we control. Files are usually sent straight out of
++	// a build directory or /tmp, so by the time he taps the attachment the path
++	// is gone or, worse, holds the *next* build under the same name.
++	if kept := keepSentMedia(abs); kept != "" {
++		abs = kept
++	}
++	if role != "user" {
++		role = "assistant"
++	}
++	rec := map[string]interface{}{
++		"ts":    time.Now().Format("2006-01-02 15:04:05"),
++		"role":  role,
++		"text":  text,
++		"media": abs,
++	}
++	if id != "" {
++		rec["ids"] = []string{id}
++	}
++	line, merr := json.Marshal(rec)
++	if merr != nil {
++		fmt.Println("media log: cannot encode:", merr)
++		return
++	}
++	f, ferr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
++	if ferr != nil {
++		fmt.Println("media log: cannot open:", ferr)
++		return
++	}
++	defer f.Close()
++	// One write of one short line, so an append here can't interleave with the
++	// bot appending to the same file from its own process.
++	if _, werr := f.Write(append(line, '\n')); werr != nil {
++		fmt.Println("media log: cannot write:", werr)
++		return
++	}
++	fmt.Println("media log: recorded", filepath.Base(abs))
++}
++
++// resolveRecipientJID turns the recipient field of a send request into the chat
++// JID the local store keys messages by. Same rules the sender uses, kept in one
++// place so a stored message can never land under a different JID than the one
++// it was actually sent to.
++func resolveRecipientJID(recipient string) (types.JID, error) {
++	if strings.Contains(recipient, "@") {
++		return types.ParseJID(recipient)
++	}
++	return types.JID{User: recipient, Server: "s.whatsapp.net"}, nil
++}
++
++// resolveParticipant turns a bare/stored sender (just the user part, as kept in
++// our messages DB) into a full JID suitable for a reply's ContextInfo.Participant.
++// It reattaches the right server by matching our own identities, which covers the
++// self-group case where every message is from us, and falls back to the default
++// phone server otherwise.
++func resolveParticipant(client *whatsmeow.Client, sender string) string {
++	if sender == "" {
++		return ""
++	}
++	if strings.Contains(sender, "@") {
++		return sender
++	}
++	if client.Store.LID.User == sender {
++		return client.Store.LID.String()
++	}
++	if client.Store.ID != nil && client.Store.ID.User == sender {
++		return client.Store.ID.String()
++	}
++	return sender + "@" + types.DefaultUserServer
+ }
+ 
+ // Function to send a WhatsApp message
+-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
++func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, quotedID, quotedSender, quotedText string) (bool, string, string) {
+ 	if !client.IsConnected() {
+-		return false, "Not connected to WhatsApp"
++		return false, "Not connected to WhatsApp", ""
+ 	}
+ 
+ 	// Create JID for recipient
+ 	var recipientJID types.JID
+ 	var err error
+ 
+-	// Check if recipient is a JID
+-	isJID := strings.Contains(recipient, "@")
+-
+-	if isJID {
+-		// Parse the JID string
+-		recipientJID, err = types.ParseJID(recipient)
+-		if err != nil {
+-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+-		}
+-	} else {
+-		// Create JID from phone number
+-		recipientJID = types.JID{
+-			User:   recipient,
+-			Server: "s.whatsapp.net", // For personal chats
+-		}
++	recipientJID, err = resolveRecipientJID(recipient)
++	if err != nil {
++		return false, fmt.Sprintf("Error parsing JID: %v", err), ""
+ 	}
+ 
+ 	msg := &waProto.Message{}
+@@ -236,7 +527,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 		// Read media file
+ 		mediaData, err := os.ReadFile(mediaPath)
+ 		if err != nil {
+-			return false, fmt.Sprintf("Error reading media file: %v", err)
++			return false, fmt.Sprintf("Error reading media file: %v", err), ""
+ 		}
+ 
+ 		// Determine media type and mime type based on file extension
+@@ -279,13 +570,36 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 		// Document types (for any other file type)
+ 		default:
+ 			mediaType = whatsmeow.MediaDocument
+-			mimeType = "application/octet-stream"
++			switch fileExt {
++				case "pdf":
++					mimeType = "application/pdf"
++				case "html", "htm":
++					mimeType = "text/html"
++				case "ipynb":
++					mimeType = "application/x-ipynb+json"
++				case "py":
++					mimeType = "text/x-python"
++				case "json":
++					mimeType = "application/json"
++				case "csv":
++					mimeType = "text/csv"
++				case "txt", "md":
++					mimeType = "text/plain"
++				case "zip":
++					mimeType = "application/zip"
++				case "doc":
++					mimeType = "application/msword"
++				case "docx":
++					mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
++				default:
++					mimeType = "application/octet-stream"
++			}
+ 		}
+ 
+ 		// Upload media to WhatsApp servers
+ 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
+ 		if err != nil {
+-			return false, fmt.Sprintf("Error uploading media: %v", err)
++			return false, fmt.Sprintf("Error uploading media: %v", err), ""
+ 		}
+ 
+ 		fmt.Println("Media uploaded", resp)
+@@ -315,7 +629,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 					seconds = analyzedSeconds
+ 					waveform = analyzedWaveform
+ 				} else {
+-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
++					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
+ 				}
+ 			} else {
+ 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+@@ -347,6 +661,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 		case whatsmeow.MediaDocument:
+ 			msg.DocumentMessage = &waProto.DocumentMessage{
+ 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
++				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+ 				Caption:       proto.String(message),
+ 				Mimetype:      proto.String(mimeType),
+ 				URL:           &resp.URL,
+@@ -357,18 +672,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 				FileLength:    &resp.FileLength,
+ 			}
+ 		}
++	} else if quotedID != "" {
++		// Text reply that quotes (references) an existing message.
++		qm := &waProto.Message{Conversation: proto.String(quotedText)}
++		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
++			Text: proto.String(message),
++			ContextInfo: &waProto.ContextInfo{
++				StanzaID:      proto.String(quotedID),
++				Participant:   proto.String(resolveParticipant(client, quotedSender)),
++				QuotedMessage: qm,
++			},
++		}
+ 	} else {
+ 		msg.Conversation = proto.String(message)
+ 	}
+ 
+ 	// Send message
+-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
++	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
+ 
+ 	if err != nil {
+-		return false, fmt.Sprintf("Error sending message: %v", err)
++		return false, fmt.Sprintf("Error sending message: %v", err), ""
+ 	}
+ 
+-	return true, fmt.Sprintf("Message sent to %s", recipient)
++	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
+ }
+ 
+ // Extract media info from a message
+@@ -641,7 +967,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
+ 	}
+ 
+ 	// Download the media using whatsmeow client
+-	mediaData, err := client.Download(downloader)
++	mediaData, err := client.Download(context.Background(), downloader)
+ 	if err != nil {
+ 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+ 	}
+@@ -668,15 +994,119 @@ func extractDirectPathFromURL(url string) string {
+ 
+ 	pathPart := parts[1]
+ 
+-	// Remove query parameters
+-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
++	// Keep the query string (ccb/oh/ot/_nc_sid): it is part of the signed direct
++	// path. whatsmeow builds the download URL as `https://{host}{directPath}&hash=...`,
++	// so stripping the query here produces an unsigned URL the CDN rejects (403).
+ 
+ 	// Create proper direct path format
+ 	return "/" + pathPart
+ }
+ 
++// markChatUnread flips a chat to "unread" on WhatsApp (the badge syncs to the
++// phone) by sending a mark-chat-as-read app-state patch with read=false,
++// anchored at the chat's most recent stored message. WhatsApp lets you mark a
++// chat unread even when you sent the last message yourself, which is exactly
++// the case for the bot's self-group replies.
++func markChatUnread(client *whatsmeow.Client, messageStore *MessageStore, jidStr string) error {
++	jid, err := types.ParseJID(jidStr)
++	if err != nil {
++		return fmt.Errorf("parse jid: %v", err)
++	}
++	var id string
++	var fromMe bool
++	var ts time.Time
++	err = messageStore.db.QueryRow(
++		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
++		jidStr).Scan(&id, &fromMe, &ts)
++	if err != nil {
++		return fmt.Errorf("no anchor message for %s: %v", jidStr, err)
++	}
++	key := &waCommon.MessageKey{
++		RemoteJID: proto.String(jidStr),
++		FromMe:    proto.Bool(fromMe),
++		ID:        proto.String(id),
++	}
++	return client.SendAppState(context.Background(),
++		appstate.BuildMarkChatAsRead(jid, false, ts, key))
++}
++
++// sendReaction reacts to a stored message with an emoji. An empty emoji removes
++// a previous reaction; sending a different one replaces it, since WhatsApp keeps
++// only one reaction per sender per message.
++//
++// The target's sender is resolved from the local store rather than taken from
++// the caller. The messages table records `sender` as a bare user part with no
++// server (msg.Info.Sender.User), and types.ParseJID on a bare number returns a
++// JID with an EMPTY User and the number as the *server*. Feeding that to
++// BuildMessageKey would mark the reaction as pointing at someone else's message
++// and attach a garbage participant, so the reaction would silently land on
++// nothing. For our own messages an empty JID is the documented way to say
++// "mine", BuildMessageKey then keeps FromMe=true and omits the participant.
++func sendReaction(client *whatsmeow.Client, messageStore *MessageStore, chatJID, messageID, emoji string) (bool, string) {
++	chat, err := types.ParseJID(chatJID)
++	if err != nil {
++		return false, fmt.Sprintf("invalid chat jid: %v", err)
++	}
++
++	var storedSender string
++	var fromMe bool
++	err = messageStore.db.QueryRow(
++		"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
++		messageID, chatJID).Scan(&storedSender, &fromMe)
++	if err != nil {
++		return false, fmt.Sprintf("unknown message %s in %s: %v", messageID, chatJID, err)
++	}
++
++	sender := types.EmptyJID
++	if !fromMe {
++		if strings.Contains(storedSender, "@") {
++			if sender, err = types.ParseJID(storedSender); err != nil {
++				return false, fmt.Sprintf("invalid sender jid %q: %v", storedSender, err)
++			}
++		} else {
++			// Bare user part: pick the server it belongs to. Group senders are
++			// increasingly LIDs rather than phone numbers.
++			server := types.DefaultUserServer
++			if lid := client.Store.GetLID(); !lid.IsEmpty() && lid.User == storedSender {
++				server = types.HiddenUserServer
++			}
++			sender = types.NewJID(storedSender, server)
++		}
++	}
++
++	resp, err := client.SendMessage(context.Background(), chat,
++		client.BuildReaction(chat, sender, messageID, emoji))
++	if err != nil {
++		return false, fmt.Sprintf("failed to send reaction: %v", err)
++	}
++	return true, fmt.Sprintf("reacted %q to %s (id %s)", emoji, messageID, resp.ID)
++}
++
+ // Start a REST API server to expose the WhatsApp client functionality
+ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
++	// Health probe. A running process is not the same as a working bridge: the
++	// phone can unlink this device, or the socket can drop, and the binary
++	// happily stays alive doing nothing. Watchdogs need to see *link* state,
++	// not just a pid, so they can shout for a re-scan instead of reporting
++	// "healthy" while every message is silently dropped.
++	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
++		jid := ""
++		pushName := ""
++		if client.Store != nil {
++			if client.Store.ID != nil {
++				jid = client.Store.ID.String()
++			}
++			pushName = client.Store.PushName
++		}
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(map[string]interface{}{
++			"connected": client.IsConnected(),
++			"logged_in": client.IsLoggedIn(),
++			"jid":       jid,
++			"push_name": pushName,
++		})
++	})
++
+ 	// Handler for sending messages
+ 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+ 		// Only allow POST requests
+@@ -706,8 +1136,68 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+ 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+ 
+ 		// Send the message
+-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
++		success, message, sentID := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.QuotedID, req.QuotedSender, req.QuotedText)
+ 		fmt.Println("Message sent", success, message)
++
++		// A file put into the watched chat has to be written to the history log
++		// too, or a companion UI has no way to know it exists.
++		if success && req.MediaPath != "" {
++			if chatJID, jerr := resolveRecipientJID(req.Recipient); jerr == nil {
++				appendMediaHistory(chatJID.String(), req.MediaPath, req.Message, req.HistoryRole, sentID)
++			}
++		}
++
++		// Record the send locally when the caller asked for it. See StoreLocal:
++		// without this, a message this API puts into a chat exists on WhatsApp
++		// and nowhere on this machine, so the bot (which reads messages.db and
++		// nothing else) never learns it was sent.
++		if success && req.StoreLocal && strings.TrimSpace(req.Message) != "" {
++			chatJID, jerr := resolveRecipientJID(req.Recipient)
++			if jerr != nil {
++				fmt.Println("store_local: cannot resolve recipient:", jerr)
++			} else {
++				id := sentID
++				if id == "" {
++					// An older send path that didn't hand back an ID: still store
++					// the message (being seen matters more than being addressable),
++					// under an ID that cannot collide with a real WhatsApp one.
++					id = fmt.Sprintf("LOCAL%d", time.Now().UnixNano())
++				}
++				sender := ""
++				if client.Store != nil && client.Store.ID != nil {
++					sender = client.Store.ID.User
++				}
++				now := time.Now()
++				if serr := messageStore.StoreMessage(id, chatJID.String(), sender, req.Message,
++					now, true, "", "", "", nil, nil, nil, 0); serr != nil {
++					fmt.Println("store_local: failed to store message:", serr)
++				} else {
++					// Keep the chat ordered by recency without touching its name:
++					// StoreChat would overwrite the name, and the bot resolves the
++					// group *by* name.
++					if _, uerr := messageStore.db.Exec(
++						"UPDATE chats SET last_message_time = ? WHERE jid = ?",
++						now, chatJID.String()); uerr != nil {
++						fmt.Println("store_local: failed to bump chat:", uerr)
++					}
++					fmt.Println("store_local: recorded", id, "in", chatJID.String())
++				}
++			}
++		}
++
++		// Optionally bump a configured chat to "unread" after a successful send,
++		// so a bot reply into it shows an unread badge on the phone. Gated by env
++		// so normal sends to other chats are never affected. Best-effort.
++		if success {
++			if target := os.Getenv("BRIDGE_MARK_UNREAD_JID"); target != "" && req.Recipient == target {
++				if err := markChatUnread(client, messageStore, req.Recipient); err != nil {
++					fmt.Println("mark unread failed:", err)
++				} else {
++					fmt.Println("marked chat unread:", req.Recipient)
++				}
++			}
++		}
++
+ 		// Set response headers
+ 		w.Header().Set("Content-Type", "application/json")
+ 
+@@ -720,9 +1210,67 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+ 		json.NewEncoder(w).Encode(SendMessageResponse{
+ 			Success: success,
+ 			Message: message,
++			ID:      sentID,
+ 		})
+ 	})
+ 
++	// Handler for marking a chat as unread (POST {"jid": "...@g.us"})
++	http.HandleFunc("/api/mark_unread", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
++			return
++		}
++		var req struct {
++			JID string `json:"jid"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			http.Error(w, "Invalid request format", http.StatusBadRequest)
++			return
++		}
++		if req.JID == "" {
++			http.Error(w, "jid is required", http.StatusBadRequest)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		if err := markChatUnread(client, messageStore, req.JID); err != nil {
++			w.WriteHeader(http.StatusInternalServerError)
++			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
++			return
++		}
++		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "marked unread"})
++	})
++
++	// Handler for reacting to a message
++	// (POST {"chat_jid": "...", "message_id": "...", "emoji": "👀"})
++	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
++			return
++		}
++		var req struct {
++			ChatJID   string `json:"chat_jid"`
++			MessageID string `json:"message_id"`
++			Emoji     string `json:"emoji"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			http.Error(w, "Invalid request format", http.StatusBadRequest)
++			return
++		}
++		if req.ChatJID == "" || req.MessageID == "" {
++			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
++			return
++		}
++		// An empty emoji is allowed: it clears an existing reaction.
++		success, message := sendReaction(client, messageStore, req.ChatJID, req.MessageID, req.Emoji)
++		fmt.Println("Reaction:", success, message)
++
++		w.Header().Set("Content-Type", "application/json")
++		if !success {
++			w.WriteHeader(http.StatusInternalServerError)
++		}
++		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
++	})
++
+ 	// Handler for downloading media
+ 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+ 		// Only allow POST requests
+@@ -774,8 +1322,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+ 		})
+ 	})
+ 
+-	// Start the server
++	// Start the server. BRIDGE_LISTEN overrides the bind address, e.g.
++	// 127.0.0.1:8080 on the server, where the API has no auth and must not
++	// be reachable from the network.
+ 	serverAddr := fmt.Sprintf(":%d", port)
++	if v := os.Getenv("BRIDGE_LISTEN"); v != "" {
++		serverAddr = v
++	}
+ 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+ 
+ 	// Run server in a goroutine so it doesn't block
+@@ -791,6 +1344,17 @@ func main() {
+ 	logger := waLog.Stdout("Client", "INFO", true)
+ 	logger.Infof("Starting WhatsApp client...")
+ 
++	// One WhatsApp session, one machine. On a machine where the bridge moved
++	// elsewhere (the laptop, once it runs on the server) this marker exists and
++	// the bridge refuses to start: two bridges on one session fight and break
++	// sends. Remove ~/.config/whatsapp-claude/REMOTE to roll back.
++	if home, err := os.UserHomeDir(); err == nil {
++		if _, err := os.Stat(filepath.Join(home, ".config/whatsapp-claude/REMOTE")); err == nil {
++			logger.Errorf("~/.config/whatsapp-claude/REMOTE exists: the bridge runs on another machine; refusing to start")
++			os.Exit(3)
++		}
++	}
++
+ 	// Create database connection for storing session data
+ 	dbLog := waLog.Stdout("Database", "INFO", true)
+ 
+@@ -800,14 +1364,14 @@ func main() {
+ 		return
+ 	}
+ 
+-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
++	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+ 	if err != nil {
+ 		logger.Errorf("Failed to connect to database: %v", err)
+ 		return
+ 	}
+ 
+ 	// Get device store - This contains session information
+-	deviceStore, err := container.GetFirstDevice()
++	deviceStore, err := container.GetFirstDevice(context.Background())
+ 	if err != nil {
+ 		if err == sql.ErrNoRows {
+ 			// No device exists, create one
+@@ -847,9 +1411,15 @@ func main() {
+ 
+ 		case *events.Connected:
+ 			logger.Infof("Connected to WhatsApp")
++			_ = os.Remove("store/logged_out.flag")
+ 
+ 		case *events.LoggedOut:
+ 			logger.Warnf("Device logged out, please scan QR code to log in again")
++			// Leave a marker the watchdog can see without parsing logs. Until
++			// someone re-scans, this process is a no-op: it will never receive
++			// or send another message.
++			_ = os.WriteFile("store/logged_out.flag",
++				[]byte(time.Now().Format(time.RFC3339)+"\n"), 0644)
+ 		}
+ 	})
+ 
+@@ -871,6 +1441,8 @@ func main() {
+ 			if evt.Event == "code" {
+ 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+ 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
++				// Also persist the raw QR payload so it can be rendered as a PNG.
++				_ = os.WriteFile("qr_code.txt", []byte(evt.Code), 0644)
+ 			} else if evt.Event == "success" {
+ 				connected <- true
+ 				break
+@@ -973,7 +1545,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+ 
+ 		// If we didn't get a name, try group info
+ 		if name == "" {
+-			groupInfo, err := client.GetGroupInfo(jid)
++			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+ 			if err == nil && groupInfo.Name != "" {
+ 				name = groupInfo.Name
+ 			} else {
+@@ -988,7 +1560,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+ 		logger.Infof("Getting name for contact: %s", chatJID)
+ 
+ 		// Just use contact info (full name)
+-		contact, err := client.Store.Contacts.GetContact(jid)
++		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+ 		if err == nil && contact.FullName != "" {
+ 			name = contact.FullName
+ 		} else if sender != "" {
+diff --git a/whatsapp-mcp-server/whatsapp.py b/whatsapp-mcp-server/whatsapp.py
+index 55ff50a..3456762 100644
+--- a/whatsapp-mcp-server/whatsapp.py
++++ b/whatsapp-mcp-server/whatsapp.py
+@@ -8,8 +8,143 @@ import json
+ import audio
+ 
+ MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
++WHATSAPP_STORE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+ WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+ 
++# When the bridge runs on another machine (the server, reached through the
++# laptop's localhost:8080 forward) this marker exists. The DB here is then a
++# read-only mirror, and any file path handed to the bridge must exist on the
++# bridge's machine, so files are copied across by scp into its RAM disk
++# (/dev/shm), which keeps sends working even when the server's disk is full.
++REMOTE_MARKER = os.path.expanduser("~/.config/whatsapp-claude/REMOTE")
++REMOTE_HOST = os.environ.get("WA_REMOTE_HOST", "server")
++REMOTE_STAGE = "/dev/shm/wa-send"
++
++
++def _remote() -> bool:
++    return os.path.exists(REMOTE_MARKER)
++
++
++def _push_to_bridge_host(path: str) -> str:
++    """Stage a local file on the bridge's machine; return the path to send.
++
++    Each file gets its own dir so the basename (the name the recipient sees)
++    is kept, and staged files older than a day are swept on every push.
++    """
++    path = os.path.abspath(path)
++    if not _remote():
++        return path
++    import shlex, subprocess, uuid
++    remote_dir = f"{REMOTE_STAGE}/{uuid.uuid4().hex[:12]}"
++    remote_path = f"{remote_dir}/{os.path.basename(path)}"
++    subprocess.run(["ssh", "-o", "BatchMode=yes", REMOTE_HOST,
++                    f"mkdir -p {shlex.quote(remote_dir)} && "
++                    f"find {REMOTE_STAGE} -mindepth 1 -maxdepth 1 -mmin +1440 "
++                    f"-exec rm -rf {{}} + 2>/dev/null; true"],
++                   check=True, timeout=120)
++    subprocess.run(["scp", "-q", "-o", "BatchMode=yes", path,
++                    f"{REMOTE_HOST}:{shlex.quote(remote_path)}"], check=True, timeout=300)
++    return remote_path
++
++
++def _pull_from_bridge_host(path: str) -> None:
++    """Copy a file the bridge wrote on its machine back to the same path here."""
++    if not _remote() or not path:
++        return
++    import shlex, subprocess
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    subprocess.run(["scp", "-q", "-p", "-o", "BatchMode=yes",
++                    f"{REMOTE_HOST}:{shlex.quote(path)}", path], check=True, timeout=300)
++
++# --- LID (Linked ID) <-> phone-number resolution ---------------------------
++# WhatsApp increasingly delivers 1:1 messages under a "@lid" JID instead of the
++# contact's "<phone>@s.whatsapp.net" JID. The same person then shows up as TWO
++# separate chats: the phone JID (usually the one carrying the saved contact
++# name, but it can go stale) and the LID JID (carries the newest messages, but
++# is named by a raw number). A lookup by contact name or phone finds only the
++# phone chat, so anything that arrived under the LID looks missing / stale.
++#
++# The bridge's whatsmeow store keeps the mapping in `whatsmeow_lid_map`
++# (lid <-> pn, as bare user parts). We use it to treat the two JIDs as one
++# logical chat: lookups return the freshest side, message listings union both,
++# and LID chats borrow the contact's real display name.
++_LID_CACHE = {"mtime": None, "lid2pn": {}, "pn2lid": {}}
++
++
++def _load_lid_maps():
++    """Return (lid2pn, pn2lid) over bare user parts, cached by store-db mtime."""
++    try:
++        mtime = os.path.getmtime(WHATSAPP_STORE_DB_PATH)
++    except OSError:
++        return _LID_CACHE["lid2pn"], _LID_CACHE["pn2lid"]
++    if _LID_CACHE["mtime"] != mtime:
++        lid2pn, pn2lid = {}, {}
++        try:
++            conn = sqlite3.connect(f"file:{WHATSAPP_STORE_DB_PATH}?mode=ro", uri=True, timeout=5)
++            try:
++                for lid, pn in conn.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
++                    lid, pn = str(lid), str(pn)
++                    lid2pn[lid] = pn
++                    pn2lid[pn] = lid
++            finally:
++                conn.close()
++        except sqlite3.Error:
++            # Degrade gracefully so the MCP never breaks if the store is locked.
++            return _LID_CACHE["lid2pn"], _LID_CACHE["pn2lid"]
++        _LID_CACHE.update(mtime=mtime, lid2pn=lid2pn, pn2lid=pn2lid)
++    return _LID_CACHE["lid2pn"], _LID_CACHE["pn2lid"]
++
++
++def _jid_user(jid: str):
++    """Bare (user, server) of a JID, stripping any device suffix like '123:6'."""
++    if not jid or '@' not in jid:
++        return jid, None
++    user, server = jid.split('@', 1)
++    return user.split(':', 1)[0], server
++
++
++def linked_jids(jid: str) -> List[str]:
++    """The JID plus its LID/phone counterpart for the same person, if known.
++
++    Groups (`@g.us`) and JIDs with no known mapping return just themselves.
++    """
++    if not jid or jid.endswith('@g.us'):
++        return [jid]
++    user, server = _jid_user(jid)
++    lid2pn, pn2lid = _load_lid_maps()
++    out = [jid]
++    if server == 'lid' and user in lid2pn:
++        out.append(f"{lid2pn[user]}@s.whatsapp.net")
++    elif server and server != 'lid' and user in pn2lid:
++        out.append(f"{pn2lid[user]}@lid")
++    seen, res = set(), []
++    for j in out:
++        if j not in seen:
++            seen.add(j)
++            res.append(j)
++    return res
++
++
++def _resolve_display_name(jid: str, raw_name: Optional[str]) -> Optional[str]:
++    """Give LID chats (named by a raw number, or unnamed) the contact name from
++    their linked phone chat. Real names are returned unchanged."""
++    if raw_name and not str(raw_name).isdigit():
++        return raw_name
++    for alt in linked_jids(jid):
++        if alt == jid:
++            continue
++        try:
++            conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True, timeout=5)
++            try:
++                row = conn.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (alt,)).fetchone()
++            finally:
++                conn.close()
++            if row and row[0] and not str(row[0]).isdigit():
++                return row[0]
++        except sqlite3.Error:
++            pass
++    return raw_name
++
+ @dataclass
+ class Message:
+     timestamp: datetime
+@@ -79,11 +214,21 @@ def get_sender_name(sender_jid: str) -> str:
+             
+             result = cursor.fetchone()
+         
++        if result and result[0] and not str(result[0]).isdigit():
++            return result[0]
++
++        # Fall back to the contact name of the linked LID/phone identity.
++        user = sender_jid.split('@')[0].split(':')[0] if sender_jid else sender_jid
++        for alt in linked_jids(f"{user}@lid") + linked_jids(f"{user}@s.whatsapp.net"):
++            row = cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (alt,)).fetchone()
++            if row and row[0] and not str(row[0]).isdigit():
++                return row[0]
++
+         if result and result[0]:
+             return result[0]
+         else:
+             return sender_jid
+-        
++
+     except sqlite3.Error as e:
+         print(f"Database error while getting sender name: {e}")
+         return sender_jid
+@@ -168,8 +313,12 @@ def list_messages(
+             params.append(sender_phone_number)
+             
+         if chat_jid:
+-            where_clauses.append("messages.chat_jid = ?")
+-            params.append(chat_jid)
++            # Union the contact's phone-JID and LID-JID chats so messages that
++            # arrived under either are all returned (merged, newest first).
++            jids = linked_jids(chat_jid)
++            placeholders = ",".join("?" for _ in jids)
++            where_clauses.append(f"messages.chat_jid IN ({placeholders})")
++            params.extend(jids)
+             
+         if query:
+             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
+@@ -192,7 +341,7 @@ def list_messages(
+             message = Message(
+                 timestamp=datetime.fromisoformat(msg[0]),
+                 sender=msg[1],
+-                chat_name=msg[2],
++                chat_name=_resolve_display_name(msg[5], msg[2]),
+                 content=msg[3],
+                 is_from_me=msg[4],
+                 chat_jid=msg[5],
+@@ -372,16 +521,16 @@ def list_chats(
+         for chat_data in chats:
+             chat = Chat(
+                 jid=chat_data[0],
+-                name=chat_data[1],
++                name=_resolve_display_name(chat_data[0], chat_data[1]),
+                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
+                 last_message=chat_data[3],
+                 last_sender=chat_data[4],
+                 last_is_from_me=chat_data[5]
+             )
+             result.append(chat)
+-            
++
+         return result
+-        
++
+     except sqlite3.Error as e:
+         print(f"Database error: {e}")
+         return []
+@@ -400,28 +549,42 @@ def search_contacts(query: str) -> List[Contact]:
+         search_pattern = '%' +query + '%'
+         
+         cursor.execute("""
+-            SELECT DISTINCT 
++            SELECT DISTINCT
+                 jid,
+                 name
+             FROM chats
+-            WHERE 
++            WHERE
+                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                 AND jid NOT LIKE '%@g.us'
+             ORDER BY name, jid
+             LIMIT 50
+         """, (search_pattern, search_pattern))
+-        
++
+         contacts = cursor.fetchall()
+-        
++
+         result = []
+-        for contact_data in contacts:
+-            contact = Contact(
+-                phone_number=contact_data[0].split('@')[0],
+-                name=contact_data[1],
+-                jid=contact_data[0]
+-            )
+-            result.append(contact)
+-            
++        seen = set()
++
++        def _add(jid, name):
++            if not jid or jid in seen:
++                return
++            seen.add(jid)
++            result.append(Contact(
++                phone_number=jid.split('@')[0],
++                name=_resolve_display_name(jid, name),
++                jid=jid,
++            ))
++
++        for jid, name in contacts:
++            _add(jid, name)
++            # A match on the phone chat should also surface the contact's linked
++            # LID chat (and vice versa), so the fresher side is discoverable.
++            for alt in linked_jids(jid):
++                if alt == jid:
++                    continue
++                arow = cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (alt,)).fetchone()
++                _add(alt, arow[0] if arow else name)
++
+         return result
+         
+     except sqlite3.Error as e:
+@@ -444,7 +607,9 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
+         conn = sqlite3.connect(MESSAGES_DB_PATH)
+         cursor = conn.cursor()
+         
+-        cursor.execute("""
++        jids = linked_jids(jid)
++        ph = ",".join("?" for _ in jids)
++        cursor.execute(f"""
+             SELECT DISTINCT
+                 c.jid,
+                 c.name,
+@@ -454,18 +619,18 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
+                 m.is_from_me as last_is_from_me
+             FROM chats c
+             JOIN messages m ON c.jid = m.chat_jid
+-            WHERE m.sender = ? OR c.jid = ?
++            WHERE m.sender IN ({ph}) OR c.jid IN ({ph})
+             ORDER BY c.last_message_time DESC
+             LIMIT ? OFFSET ?
+-        """, (jid, jid, limit, page * limit))
+-        
++        """, (*jids, *jids, limit, page * limit))
++
+         chats = cursor.fetchall()
+-        
++
+         result = []
+         for chat_data in chats:
+             chat = Chat(
+                 jid=chat_data[0],
+-                name=chat_data[1],
++                name=_resolve_display_name(chat_data[0], chat_data[1]),
+                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
+                 last_message=chat_data[3],
+                 last_sender=chat_data[4],
+@@ -489,8 +654,10 @@ def get_last_interaction(jid: str) -> str:
+         conn = sqlite3.connect(MESSAGES_DB_PATH)
+         cursor = conn.cursor()
+         
+-        cursor.execute("""
+-            SELECT 
++        jids = linked_jids(jid)
++        ph = ",".join("?" for _ in jids)
++        cursor.execute(f"""
++            SELECT
+                 m.timestamp,
+                 m.sender,
+                 c.name,
+@@ -501,10 +668,10 @@ def get_last_interaction(jid: str) -> str:
+                 m.media_type
+             FROM messages m
+             JOIN chats c ON m.chat_jid = c.jid
+-            WHERE m.sender = ? OR c.jid = ?
++            WHERE m.sender IN ({ph}) OR c.jid IN ({ph})
+             ORDER BY m.timestamp DESC
+             LIMIT 1
+-        """, (jid, jid))
++        """, (*jids, *jids))
+         
+         msg_data = cursor.fetchone()
+         
+@@ -586,8 +753,14 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
+         conn = sqlite3.connect(MESSAGES_DB_PATH)
+         cursor = conn.cursor()
+         
+-        cursor.execute("""
+-            SELECT 
++        # Consider both the phone JID and any linked LID JID, and return the
++        # chat with the most recent activity (so a contact whose newest messages
++        # arrived under a LID is not reported as stale).
++        candidates = set(linked_jids(f"{sender_phone_number}@s.whatsapp.net"))
++        candidates.update(linked_jids(f"{sender_phone_number}@lid"))
++        placeholders = ",".join("?" for _ in candidates)
++        cursor.execute(f"""
++            SELECT
+                 c.jid,
+                 c.name,
+                 c.last_message_time,
+@@ -595,20 +768,21 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
+                 m.sender as last_sender,
+                 m.is_from_me as last_is_from_me
+             FROM chats c
+-            LEFT JOIN messages m ON c.jid = m.chat_jid 
++            LEFT JOIN messages m ON c.jid = m.chat_jid
+                 AND c.last_message_time = m.timestamp
+-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
++            WHERE (c.jid IN ({placeholders}) OR c.jid LIKE ?) AND c.jid NOT LIKE '%@g.us'
++            ORDER BY c.last_message_time DESC
+             LIMIT 1
+-        """, (f"%{sender_phone_number}%",))
+-        
++        """, (*candidates, f"%{sender_phone_number}%"))
++
+         chat_data = cursor.fetchone()
+-        
++
+         if not chat_data:
+             return None
+-            
++
+         return Chat(
+             jid=chat_data[0],
+-            name=chat_data[1],
++            name=_resolve_display_name(chat_data[0], chat_data[1]),
+             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
+             last_message=chat_data[3],
+             last_sender=chat_data[4],
+@@ -622,6 +796,43 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
+         if 'conn' in locals():
+             conn.close()
+ 
++# The control group has a second reader: the bot's history log, which
++# gives the bot its conversation context. Anything sent into that group
++# from here (a file, a message sent outside the bot's own reply path) is invisible
++# to the bot unless it is logged too, which is why sends below mirror themselves.
++CLAUDE_GROUP_JID = os.environ.get("CLAUDE_GROUP_JID", "")  # set to your control group JID to enable mirroring
++CLAUDE_HISTORY_FILE = os.path.expanduser("~/.config/claude-whatsapp/history.jsonl")
++
++
++def _mirror_to_claude_history(recipient: str, text: str, msg_id: str = "", media: str = "") -> None:
++    """Best-effort: a failure here must never turn a successful send into an error."""
++    if not CLAUDE_GROUP_JID or recipient != CLAUDE_GROUP_JID:
++        return
++    try:
++        os.makedirs(os.path.dirname(CLAUDE_HISTORY_FILE), exist_ok=True)
++        rec = {
++            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
++            "role": "assistant",
++            "text": text,
++        }
++        if msg_id:
++            rec["ids"] = [msg_id]
++        if media:
++            rec["media"] = media
++        line = json.dumps(rec, ensure_ascii=False) + "\n"
++        if _remote():
++            # The app and the bot read the log on the bridge's machine.
++            import subprocess
++            subprocess.run(["ssh", "-o", "BatchMode=yes", REMOTE_HOST,
++                            "cat >> ~/.config/claude-whatsapp/history.jsonl"],
++                           input=line.encode("utf-8"), check=True, timeout=30)
++            return
++        with open(CLAUDE_HISTORY_FILE, "a", encoding="utf-8") as f:
++            f.write(line)
++    except Exception as e:
++        print(f"history mirror failed: {e}")
++
++
+ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+     try:
+         # Validate input
+@@ -639,7 +850,10 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+         # Check if the request was successful
+         if response.status_code == 200:
+             result = response.json()
+-            return result.get("success", False), result.get("message", "Unknown response")
++            ok = result.get("success", False)
++            if ok:
++                _mirror_to_claude_history(recipient, message, result.get("id", ""))
++            return ok, result.get("message", "Unknown response")
+         else:
+             return False, f"Error: HTTP {response.status_code} - {response.text}"
+             
+@@ -662,6 +876,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+         if not os.path.isfile(media_path):
+             return False, f"Media file not found: {media_path}"
+         
++        media_path = _push_to_bridge_host(media_path)
+         url = f"{WHATSAPP_API_BASE_URL}/send"
+         payload = {
+             "recipient": recipient,
+@@ -673,7 +888,11 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+         # Check if the request was successful
+         if response.status_code == 200:
+             result = response.json()
+-            return result.get("success", False), result.get("message", "Unknown response")
++            ok = result.get("success", False)
++            # No mirroring here: the bridge logs every file it sends into the
++            # group itself, whoever asked for it. Doing it here as well put the
++            # same attachment in a companion UI twice.
++            return ok, result.get("message", "Unknown response")
+         else:
+             return False, f"Error: HTTP {response.status_code} - {response.text}"
+             
+@@ -702,6 +921,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+             except Exception as e:
+                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
+         
++        media_path = _push_to_bridge_host(media_path)
+         url = f"{WHATSAPP_API_BASE_URL}/send"
+         payload = {
+             "recipient": recipient,
+@@ -747,6 +967,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
+             result = response.json()
+             if result.get("success", False):
+                 path = result.get("path")
++                _pull_from_bridge_host(path)
+                 print(f"Media downloaded successfully: {path}")
+                 return path
+             else:

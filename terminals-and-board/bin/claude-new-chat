@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# claude-new-chat, Ctrl+Alt+Y: open a terminal (like Ctrl+Alt+T) that is ALREADY
+# inside a brand-new Claude chat in the System project. No board, no menus, no
+# thinking-level prompt (it uses the persisted default). Ctrl+Z detaches from the
+# chat, it keeps running, and drops you on the normal claude-c board, in System.
+#
+# Pass a project key to start somewhere else, e.g.:
+#   claude-new-chat $HOME/code/myapp
+#   claude-new-chat HW
+#
+# Detaches from the calling shell (see ~/.claude memory: launchers-must-detach).
+
+PROJECT="${1:-$HOME}"
+BOARD="$HOME/.local/bin/claude-c"
+
+# The command is run under `bash -l` so ~/.profile is sourced and `claude` is on
+# PATH even when the keybinding fires with a bare session environment.
+INNER=(bash -lc 'exec "$1" --new "$2"' _ "$BOARD" "$PROJECT")
+
+# Use the SAME terminal Ctrl+Alt+T opens, Terminator here (it's the
+# x-terminal-emulator alternative), so the window carries the wallpaper-theme
+# background and gets tiled like every other terminal. Ptyxis is only a fallback
+# for a machine without Terminator. -u (no dbus) guarantees a real new window
+# that actually runs our command instead of the running instance quietly opening
+# a plain shell.
+if command -v terminator >/dev/null 2>&1; then
+    setsid -f terminator -u -T "New Claude chat" \
+        --working-directory "$HOME" -x "${INNER[@]}" \
+        >/dev/null 2>&1
+elif command -v ptyxis >/dev/null 2>&1; then
+    # NOTE: ptyxis's -x takes ONE command string, so the argv form is used.
+    setsid -f ptyxis --standalone --title "New Claude chat" -- "${INNER[@]}" \
+        >/dev/null 2>&1
+else
+    setsid -f x-terminal-emulator -e "${INNER[*]}" >/dev/null 2>&1
+fi

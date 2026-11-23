@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude WhatsApp monitor: auto-replies, tool-less, to explicitly armed chats only (see wa-monitor)
+After=network-online.target whatsapp-bridge.service
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Put CWM_OWNER_NAME=YourName and CWM_ASSISTANT_NAME=... in this file.
+EnvironmentFile=-%h/.config/claude-whatsapp/monitor.env
+ExecStart=/usr/bin/python3 __MONITOR_PY__
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

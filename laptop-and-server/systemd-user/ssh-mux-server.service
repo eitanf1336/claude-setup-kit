@@ -1,0 +1,15 @@
+# Laptop. Owns the shared ssh master for the "server" host, so a terminal that dies or freezes
+# cannot take the master (and every later ssh) with it. Needs "ControlMaster no" + the ControlPath
+# from config/ssh_config.example for that host.
+[Unit]
+Description=ssh master connection to the home server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -M -N -o ControlMaster=yes -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 server
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

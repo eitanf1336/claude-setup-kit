@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# wa-reconnect, ensure the WhatsApp bridge is linked, popping a QR window if a
+# scan is needed. The window refreshes the code automatically and closes itself
+# the moment the phone links. Designed to be invoked by Claude or by hand.
+#
+#   wa-reconnect            # link if needed; no-op if already connected
+#   wa-reconnect --force    # always re-pair (shows QR even if linked)
+#
+# Exit: 0 linked, 1 cancelled/failed.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PATH="$HERE:$PATH"
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
+[ -f "$CFG" ] && . "$CFG"
+WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
+BRIDGE_DIR="$WA_REPO/whatsapp-bridge"
+QR_TXT="$BRIDGE_DIR/qr_code.txt"
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+mkdir -p "$STATE"
+LOG="$STATE/bridge.log"
+QR_PNG="$STATE/qr.png"
+STATUS="$STATE/popup.status"
+
+FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+note() { command -v notify-send >/dev/null 2>&1 && notify-send "WhatsApp" "$1" || true; echo "[wa-reconnect] $1"; }
+
+# Fresh bridge session so we deterministically see either auth or a QR.
+wa-bridge-ctl stop >/dev/null 2>&1 || true
+: > "$LOG"; rm -f "$QR_TXT" "$QR_PNG"; echo waiting > "$STATUS"
+wa-bridge-ctl start >/dev/null
+
+# Wait for the bridge to either authenticate (already linked) or emit a QR.
+for _ in $(seq 1 60); do
+  if [ -f "$QR_TXT" ]; then break; fi
+  if grep -qi "Connected to WhatsApp" "$LOG" 2>/dev/null; then break; fi
+  sleep 0.5
+done
+
+if [ ! -f "$QR_TXT" ] && grep -qi "Connected to WhatsApp" "$LOG" 2>/dev/null && [ "$FORCE" -eq 0 ]; then
+  note "Already linked, bridge connected."
+  exit 0
+fi
+
+if [ ! -f "$QR_TXT" ]; then
+  note "Bridge did not produce a QR or connect. Check $LOG"
+  exit 1
+fi
+
+# QR path: render, pop the window, and supervise until linked.
+wa-render-qr "$QR_TXT" "$QR_PNG"
+note "Scan the QR window to link WhatsApp."
+( wa-qr-popup --image "$QR_PNG" --status "$STATUS" ) &
+POPUP_PID=$!
+
+prev=""; overall=0
+while kill -0 "$POPUP_PID" 2>/dev/null; do
+  if grep -qi "Successfully connected" "$LOG" 2>/dev/null; then
+    echo connected > "$STATUS"; break
+  fi
+  if [ "$(cat "$STATUS" 2>/dev/null)" = "cancel" ]; then
+    note "Linking cancelled."
+    wa-bridge-ctl stop >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if [ -f "$QR_TXT" ]; then
+    cur="$(cat "$QR_TXT" 2>/dev/null)"
+    if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
+      wa-render-qr "$QR_TXT" "$QR_PNG" 2>/dev/null || true
+      prev="$cur"
+    fi
+  fi
+  # If WhatsApp closed the QR channel, restart for a fresh code.
+  if grep -qiE "Error sending close to websocket|Timeout waiting for QR" "$LOG" 2>/dev/null \
+     && ! grep -qi "Successfully connected" "$LOG" 2>/dev/null; then
+    echo expired > "$STATUS"
+    wa-bridge-ctl restart >/dev/null 2>&1 || true
+    prev=""
+  fi
+  sleep 1; overall=$((overall+1))
+  [ "$overall" -gt 900 ] && { note "Timed out waiting to link."; kill "$POPUP_PID" 2>/dev/null; exit 1; }
+done
+
+wait "$POPUP_PID" 2>/dev/null || true
+if grep -qi "Successfully connected\|Connected to WhatsApp" "$LOG" 2>/dev/null; then
+  note "✓ WhatsApp linked."
+  exit 0
+fi
+exit 1

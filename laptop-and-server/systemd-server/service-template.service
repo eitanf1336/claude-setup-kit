@@ -1,0 +1,20 @@
+# Template for a new always-on service on the server.
+# Install: ~/.config/systemd/user/NAME.service ; systemctl --user daemon-reload ; systemctl --user enable --now NAME
+# Needs `loginctl enable-linger $USER` once, so user units run with nobody logged in.
+[Unit]
+Description=EXAMPLE service
+# Boot happens before WiFi is up. Anything that fetches from the network needs these two lines,
+# or it caches a failed fetch and shows empty data until restarted.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/code/EXAMPLE
+ExecStart=%h/code/EXAMPLE/.venv/bin/python app.py
+# claude, uv and node live under ~/.local/bin or ~/bin and are not on a user unit's default PATH.
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

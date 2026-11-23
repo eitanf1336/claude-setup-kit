@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Server</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f14;color:#e6edf3;font:22px/1.5 system-ui,sans-serif}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:3vw;padding:4vw}
+  h2{margin:0 0 .5em;font-size:1em;letter-spacing:.12em;text-transform:uppercase;color:#7d8590}
+  .big{font-size:2.4em;font-weight:600}
+  li{list-style:none;margin:.2em 0} ul{padding:0;margin:0}
+  .word{display:inline-block;min-width:7em;color:#58a6ff}
+  .dim{color:#7d8590}
+</style>
+<main>
+  <section><h2 id="host">server</h2><div class="big" id="up"></div><div id="res" class="dim"></div></section>
+  <section><h2>Running now</h2><ul id="now"></ul></section>
+  <section><h2>Services</h2><ul id="svc"></ul></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+async function tick() {
+  try {
+    // ?role=main is how kiosk-watchdog knows this page is alive
+    const s = await (await fetch('/api/stats?role=main')).json();
+    $('host').textContent = s.host;
+    $('up').textContent = 'up ' + Math.floor(s.uptime_s / 3600) + ' h';
+    $('res').textContent = `load ${s.load.map(x => x.toFixed(2)).join(' ')} | RAM ${s.ram_used_mb}/${s.ram_total_mb} MB | disk ${s.disk_used_gb}/${s.disk_total_gb} GB`;
+    $('svc').innerHTML = s.services.map(n => `<li>${n.replace('.service', '')}</li>`).join('');
+    const items = s.running.items;
+    $('now').innerHTML = items.length
+      ? items.map(i => `<li><span class="word">${i.word}</span>${i.name} <span class="dim">${i.detail}</span></li>`).join('')
+      : '<li class="dim">nothing set</li>';
+  } catch (e) { /* server restarting: try again */ }
+}
+tick(); setInterval(tick, 5000);
+</script>
